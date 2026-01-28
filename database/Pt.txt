@@ -1,0 +1,6 @@
+39.5447 - substrate - Pt(111)
+45.9858 - substrate - Pt(200)
+67.0658 - substrate - Pt(220)
+80.7466 - substrate - Pt(311)
+85.1521 - substrate - Pt(222)
+102.747 - substrate - Pt(400)

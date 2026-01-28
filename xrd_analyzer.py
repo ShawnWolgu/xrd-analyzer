@@ -18,11 +18,13 @@ class Peak:
     """单个峰的数据结构"""
     def __init__(self, peak_id: int, center_guess: float, 
                  bounds: Tuple[float, float] = None,
-                 peak_type: str = 'film'):
+                 peak_type: str = 'film',
+                 name: str = ''):
         self.peak_id = peak_id
         self.center_guess = center_guess
         self.bounds = bounds if bounds else (center_guess - 0.5, center_guess + 0.5)
         self.peak_type = peak_type  # 'film' or 'substrate'
+        self.name = name
         
         # 拟合结果
         self.center = None
@@ -225,10 +227,11 @@ class Fitter:
         
     def add_peak(self, center_guess: float, 
                  bounds: Tuple[float, float] = None,
-                 peak_type: str = 'film') -> Peak:
+                 peak_type: str = 'film',
+                 name: str = '') -> Peak:
         """添加峰"""
         peak_id = len(self.peaks)
-        peak = Peak(peak_id, center_guess, bounds, peak_type)
+        peak = Peak(peak_id, center_guess, bounds, peak_type, name)
         self.peaks.append(peak)
         return peak
     

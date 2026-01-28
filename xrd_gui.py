@@ -76,14 +76,24 @@ class InteractivePlotCanvas(MplCanvas):
             self.axes.set_xlabel('2θ (degree)', fontsize=11, fontweight='bold')
             self.axes.set_ylabel('Intensity (a.u.)', fontsize=11, fontweight='bold')
             self.axes.set_yscale(self.yscale)  # Apply current scale
+            self.axes.set_xlim(self.x_data.min(), self.x_data.max()) # Enforce x-limits
             self.axes.grid(True, alpha=0.3)
             self.axes.legend()
         self.draw()
     
-    def add_peak_marker(self, x_pos, y_pos, peak_id):
+    def add_peak_marker(self, x_pos, y_pos, peak_id, name=''):
         """添加峰标记"""
+        label_text = name if name else f'Peak {peak_id}'
         marker = self.axes.plot(x_pos, y_pos, 'ro', markersize=8, 
-                               label=f'Peak {peak_id}')[0]
+                               label=label_text)[0]
+        
+        # Add text annotation
+        if name:
+            annotation = self.axes.annotate(name, (x_pos, y_pos), 
+                                          xytext=(0, 10), textcoords='offset points',
+                                          ha='center', fontsize=9, color='red')
+            self.peak_markers.append(annotation)
+            
         self.peak_markers.append(marker)
         self.axes.legend()
         self.draw()
@@ -118,6 +128,11 @@ class PeakConfigDialog(QDialog):
         self.setMinimumWidth(400)
         
         layout = QFormLayout()
+        
+        # 峰名称
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("可选，例如: PZT(002)")
+        layout.addRow("峰名称:", self.name_edit)
         
         # 峰中心
         self.center_spin = QDoubleSpinBox()
@@ -167,7 +182,8 @@ class PeakConfigDialog(QDialog):
             'center': self.center_spin.value(),
             'min': self.min_spin.value(),
             'max': self.max_spin.value(),
-            'type': self.type_combo.currentText()
+            'type': self.type_combo.currentText(),
+            'name': self.name_edit.text().strip()
         }
 
 
@@ -405,6 +421,24 @@ class XRDAnalyzerGUI(QMainWindow):
         auto_peak_layout.addWidget(self.peak_threshold)
         peak_layout.addLayout(auto_peak_layout)
         
+        # 快速添加
+        quick_add_layout = QHBoxLayout()
+        self.quick_peak_input = QLineEdit()
+        self.quick_peak_input.setPlaceholderText("角度 - 类型 - 名称 (例: 46.5 - film - PZT(002))")
+        quick_add_layout.addWidget(self.quick_peak_input)
+        
+        quick_add_btn = QPushButton("添加")
+        quick_add_btn.clicked.connect(self.quick_add_peak)
+        quick_add_layout.addWidget(quick_add_btn)
+        peak_layout.addLayout(quick_add_layout)
+        
+        # 导入/导出峰
+        io_peak_layout = QHBoxLayout()
+        import_peak_btn = QPushButton("导入峰列表 (.txt)")
+        import_peak_btn.clicked.connect(self.import_peaks_from_file)
+        io_peak_layout.addWidget(import_peak_btn)
+        peak_layout.addLayout(io_peak_layout)
+        
         # 手动添加峰
         manual_peak_btn = QPushButton("手动添加峰 (点击图上)")
         manual_peak_btn.setCheckable(True)
@@ -414,9 +448,9 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 峰列表 (移除最大高度限制)
         self.peak_table = QTableWidget()
-        self.peak_table.setColumnCount(5)
+        self.peak_table.setColumnCount(6)
         self.peak_table.setHorizontalHeaderLabels(
-            ['ID', '中心', '最小', '最大', '类型']
+            ['ID', '名称', '中心', '最小', '最大', '类型']
         )
         self.peak_table.setMinimumHeight(200)
         peak_layout.addWidget(self.peak_table)
@@ -733,7 +767,8 @@ class XRDAnalyzerGUI(QMainWindow):
             self.add_peak_to_fitter(
                 values['center'],
                 (values['min'], values['max']),
-                values['type']
+                values['type'],
+                values['name']
             )
             
     def auto_find_peaks(self):
@@ -761,19 +796,19 @@ class XRDAnalyzerGUI(QMainWindow):
         
         self.statusBar().showMessage(f'自动找到 {len(peak_positions)} 个峰')
     
-    def add_peak_to_fitter(self, center, bounds, peak_type):
+    def add_peak_to_fitter(self, center, bounds, peak_type, name=''):
         """添加峰到拟合器"""
         if self.fitter is None:
             self.fitter = Fitter(self.x_data, self.y_data)
         
-        peak = self.fitter.add_peak(center, bounds, peak_type)
+        peak = self.fitter.add_peak(center, bounds, peak_type, name)
         
         # 更新表格
         self.update_peak_table()
         
         # 在图上标记
         idx = np.argmin(np.abs(self.x_data - center))
-        self.plot_canvas.add_peak_marker(center, self.y_data[idx], peak.peak_id)
+        self.plot_canvas.add_peak_marker(center, self.y_data[idx], peak.peak_id, name)
         
     def update_peak_table(self):
         """更新峰表格"""
@@ -784,11 +819,92 @@ class XRDAnalyzerGUI(QMainWindow):
         
         for i, peak in enumerate(self.fitter.peaks):
             self.peak_table.setItem(i, 0, QTableWidgetItem(str(peak.peak_id)))
-            self.peak_table.setItem(i, 1, QTableWidgetItem(f"{peak.center_guess:.3f}"))
-            self.peak_table.setItem(i, 2, QTableWidgetItem(f"{peak.bounds[0]:.3f}"))
-            self.peak_table.setItem(i, 3, QTableWidgetItem(f"{peak.bounds[1]:.3f}"))
-            self.peak_table.setItem(i, 4, QTableWidgetItem(peak.peak_type))
+            self.peak_table.setItem(i, 1, QTableWidgetItem(peak.name))
+            self.peak_table.setItem(i, 2, QTableWidgetItem(f"{peak.center_guess:.3f}"))
+            self.peak_table.setItem(i, 3, QTableWidgetItem(f"{peak.bounds[0]:.3f}"))
+            self.peak_table.setItem(i, 4, QTableWidgetItem(f"{peak.bounds[1]:.3f}"))
+            self.peak_table.setItem(i, 5, QTableWidgetItem(peak.peak_type))
     
+    def quick_add_peak(self):
+        """快速添加峰"""
+        text = self.quick_peak_input.text().strip()
+        if not text:
+            return
+            
+        try:
+            # 解析格式: angle - type - name
+            parts = [p.strip() for p in text.split('-')]
+            
+            if len(parts) < 1:
+                raise ValueError("格式错误")
+                
+            center = float(parts[0])
+            
+            peak_type = 'film'
+            if len(parts) >= 2:
+                t = parts[1].lower()
+                if 'sub' in t:
+                    peak_type = 'substrate'
+                elif 'film' in t:
+                    peak_type = 'film'
+            
+            name = ''
+            if len(parts) >= 3:
+                name = parts[2]
+                
+            # 添加
+            self.add_peak_to_fitter(center, (center-0.5, center+0.5), peak_type, name)
+            self.quick_peak_input.clear()
+            self.statusBar().showMessage(f"已添加峰: {center}° {name}")
+            
+        except ValueError:
+            QMessageBox.warning(self, "格式错误", 
+                              "请使用格式: 角度 - 类型 - 名称\n例如: 46.5 - film - PZT(002)")
+
+    def import_peaks_from_file(self):
+        """从文件导入峰列表"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "导入峰列表", "", "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            count = 0
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                        
+                    parts = [p.strip() for p in line.split('-')]
+                    if len(parts) < 1:
+                        continue
+                        
+                    try:
+                        center = float(parts[0])
+                        
+                        peak_type = 'film'
+                        if len(parts) >= 2:
+                            t = parts[1].lower()
+                            if 'sub' in t:
+                                peak_type = 'substrate'
+                        
+                        name = ''
+                        if len(parts) >= 3:
+                            name = parts[2]
+                            
+                        self.add_peak_to_fitter(center, (center-0.5, center+0.5), peak_type, name)
+                        count += 1
+                    except ValueError:
+                        continue
+                        
+            self.statusBar().showMessage(f"成功导入 {count} 个峰")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", f"错误: {str(e)}")
+
     def delete_selected_peak(self):
         """删除选中的峰"""
         if self.fitter is None:
@@ -818,7 +934,7 @@ class XRDAnalyzerGUI(QMainWindow):
         for peak in self.fitter.peaks:
             idx = np.argmin(np.abs(self.x_data - peak.center_guess))
             self.plot_canvas.add_peak_marker(
-                peak.center_guess, self.y_data[idx], peak.peak_id
+                peak.center_guess, self.y_data[idx], peak.peak_id, peak.name
             )
     
     def clear_all_peaks(self):
@@ -919,8 +1035,27 @@ class XRDAnalyzerGUI(QMainWindow):
         ax.set_ylabel('Intensity (a.u.)', fontsize=12, fontweight='bold')
         ax.set_title('XRD Pattern Fitting', fontsize=14, fontweight='bold')
         ax.set_yscale(self.plot_canvas.yscale)  # Keep consistent scale
+        
+        # 强制设置X轴范围为当前数据范围
+        if self.fitter.x_data is not None:
+            ax.set_xlim(self.fitter.x_data.min(), self.fitter.x_data.max())
+            
         ax.legend(loc='best', fontsize=9, framealpha=0.9)
         ax.grid(True, alpha=0.3, linestyle='--')
+        
+        # 添加峰标记信息
+        for peak in self.fitter.peaks:
+            label = peak.name if peak.name else f'Peak {peak.peak_id}'
+            # 使用拟合后的位置，如果还没拟合完则使用猜测值
+            center = peak.center if peak.center is not None else peak.center_guess
+            height = peak.height if peak.height is not None else 0
+            
+            # 在峰顶添加文字
+            ax.annotate(label, 
+                       xy=(center, height), 
+                       xytext=(0, 10), textcoords='offset points',
+                       ha='center', va='bottom',
+                       fontsize=9, color='darkblue', fontweight='bold')
         
         # 添加R²文本
         r2 = self.reporter.metrics['R_squared']
