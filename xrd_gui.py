@@ -50,6 +50,7 @@ class InteractivePlotCanvas(MplCanvas):
         self.y_data = None
         self.peak_markers = []
         self.mode = 'view'  # 'view' or 'add_peak'
+        self.yscale = 'linear'  # 'linear' or 'log'
         
         # 连接鼠标事件
         self.mpl_connect('button_press_event', self.on_click)
@@ -60,6 +61,13 @@ class InteractivePlotCanvas(MplCanvas):
         self.y_data = y_data
         self.plot_data()
         
+    def set_yscale(self, scale):
+        """设置Y轴刻度"""
+        self.yscale = scale
+        if self.axes:
+            self.axes.set_yscale(scale)
+            self.draw()
+        
     def plot_data(self):
         """绘制数据"""
         self.axes.clear()
@@ -67,6 +75,7 @@ class InteractivePlotCanvas(MplCanvas):
             self.axes.plot(self.x_data, self.y_data, 'b-', linewidth=1.5, label='Data')
             self.axes.set_xlabel('2θ (degree)', fontsize=11, fontweight='bold')
             self.axes.set_ylabel('Intensity (a.u.)', fontsize=11, fontweight='bold')
+            self.axes.set_yscale(self.yscale)  # Apply current scale
             self.axes.grid(True, alpha=0.3)
             self.axes.legend()
         self.draw()
@@ -212,6 +221,9 @@ class XRDAnalyzerGUI(QMainWindow):
         self.y_data_original = None  # 新增
         self.current_file = None
         
+        # 多文件管理
+        self.loaded_files_data = []  # List[Tuple[filepath, x, y]]
+        
         # 处理对象
         self.fitter = None
         self.reporter = None
@@ -240,7 +252,7 @@ class XRDAnalyzerGUI(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         
         main_layout.addWidget(splitter)
@@ -256,20 +268,37 @@ class XRDAnalyzerGUI(QMainWindow):
     def create_left_panel(self):
         """创建左侧控制面板"""
         panel = QWidget()
-        layout = QVBoxLayout()
-        panel.setLayout(layout)
+        # 改为水平布局以容纳两列
+        main_layout = QHBoxLayout()
+        panel.setLayout(main_layout)
+        
+        # === 左列：数据加载与预处理 ===
+        col1_layout = QVBoxLayout()
         
         # 1. 文件加载组
-        file_group = QGroupBox("1. 数据加载")
+        file_group = QGroupBox("1. 数据加载与合并")
         file_layout = QVBoxLayout()
         
-        load_btn = QPushButton("加载XRD数据")
-        load_btn.clicked.connect(self.load_file)
-        file_layout.addWidget(load_btn)
+        # 按钮区
+        btn_layout = QHBoxLayout()
+        load_btn = QPushButton("添加数据文件")
+        load_btn.clicked.connect(self.add_files)
+        btn_layout.addWidget(load_btn)
         
-        self.file_label = QLabel("未加载文件")
-        self.file_label.setWordWrap(True)
-        file_layout.addWidget(self.file_label)
+        remove_btn = QPushButton("移除选中")
+        remove_btn.clicked.connect(self.remove_file)
+        btn_layout.addWidget(remove_btn)
+        
+        clear_btn = QPushButton("清空")
+        clear_btn.clicked.connect(self.clear_files)
+        btn_layout.addWidget(clear_btn)
+        
+        file_layout.addLayout(btn_layout)
+        
+        # 文件列表
+        self.file_list_widget = QListWidget()
+        self.file_list_widget.setMaximumHeight(150)
+        file_layout.addWidget(self.file_list_widget)
         
         # 数据范围
         range_layout = QHBoxLayout()
@@ -289,8 +318,19 @@ class XRDAnalyzerGUI(QMainWindow):
         apply_range_btn.clicked.connect(self.apply_range)
         file_layout.addWidget(apply_range_btn)
         
+        # Y轴显示模式
+        yscale_layout = QHBoxLayout()
+        yscale_layout.addWidget(QLabel("Y轴显示:"))
+        self.linear_radio = QRadioButton("Linear")
+        self.linear_radio.setChecked(True)
+        self.log_radio = QRadioButton("Log")
+        self.linear_radio.toggled.connect(self.toggle_yscale)
+        yscale_layout.addWidget(self.linear_radio)
+        yscale_layout.addWidget(self.log_radio)
+        file_layout.addLayout(yscale_layout)
+        
         file_group.setLayout(file_layout)
-        layout.addWidget(file_group)
+        col1_layout.addWidget(file_group)
         
         # 2. 预处理组
         preprocess_group = QGroupBox("2. 数据预处理")
@@ -340,7 +380,13 @@ class XRDAnalyzerGUI(QMainWindow):
         preprocess_layout.addWidget(reset_btn)
         
         preprocess_group.setLayout(preprocess_layout)
-        layout.addWidget(preprocess_group)
+        col1_layout.addWidget(preprocess_group)
+        
+        col1_layout.addStretch()
+        main_layout.addLayout(col1_layout)
+        
+        # === 右列：峰管理与拟合 ===
+        col2_layout = QVBoxLayout()
         
         # 3. 峰管理组
         peak_group = QGroupBox("3. 峰识别与管理")
@@ -366,13 +412,13 @@ class XRDAnalyzerGUI(QMainWindow):
         peak_layout.addWidget(manual_peak_btn)
         self.manual_peak_btn = manual_peak_btn
         
-        # 峰列表
+        # 峰列表 (移除最大高度限制)
         self.peak_table = QTableWidget()
         self.peak_table.setColumnCount(5)
         self.peak_table.setHorizontalHeaderLabels(
             ['ID', '中心', '最小', '最大', '类型']
         )
-        self.peak_table.setMaximumHeight(200)
+        self.peak_table.setMinimumHeight(200)
         peak_layout.addWidget(self.peak_table)
         
         # 删除峰按钮
@@ -385,7 +431,7 @@ class XRDAnalyzerGUI(QMainWindow):
         peak_layout.addWidget(clear_peaks_btn)
         
         peak_group.setLayout(peak_layout)
-        layout.addWidget(peak_group)
+        col2_layout.addWidget(peak_group, 1) # 让其占据多余空间
         
         # 4. 拟合配置组
         fit_group = QGroupBox("4. 拟合配置")
@@ -431,7 +477,7 @@ class XRDAnalyzerGUI(QMainWindow):
         fit_layout.addWidget(execute_fit_btn)
         
         fit_group.setLayout(fit_layout)
-        layout.addWidget(fit_group)
+        col2_layout.addWidget(fit_group)
         
         # 5. 结果导出组
         export_group = QGroupBox("5. 结果导出")
@@ -446,9 +492,9 @@ class XRDAnalyzerGUI(QMainWindow):
         export_layout.addWidget(export_figure_btn)
         
         export_group.setLayout(export_layout)
-        layout.addWidget(export_group)
+        col2_layout.addWidget(export_group)
         
-        layout.addStretch()
+        main_layout.addLayout(col2_layout)
         
         return panel
     
@@ -505,32 +551,110 @@ class XRDAnalyzerGUI(QMainWindow):
     
     # === 事件处理函数 ===
     
-    def load_file(self):
-        """加载文件"""
-        file_path, _ = QFileDialog.getOpenFileName(
+    def add_files(self):
+        """添加文件"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self, "选择XRD数据文件", "", "Text Files (*.txt *.TXT)"
         )
         
-        if file_path:
+        if not file_paths:
+            return
+            
+        success_count = 0
+        for file_path in file_paths:
             try:
-                self.x_data_raw, self.y_data_raw = DataLoader.load_txt(file_path)
-                self.x_data = self.x_data_raw.copy()
-                self.y_data = self.y_data_raw.copy()
-                self.x_data_original = self.x_data_raw.copy()
-                self.y_data_original = self.y_data_raw.copy()
-                self.current_file = file_path
+                # 检查是否已加载
+                if any(f[0] == file_path for f in self.loaded_files_data):
+                    continue
+                    
+                x, y = DataLoader.load_txt(file_path)
+                self.loaded_files_data.append((file_path, x, y))
                 
-                self.file_label.setText(f"已加载: {Path(file_path).name}")
-                self.plot_canvas.set_data(self.x_data, self.y_data)
+                # 添加到列表UI
+                item = QListWidgetItem(Path(file_path).name)
+                item.setToolTip(file_path)
+                self.file_list_widget.addItem(item)
                 
-                # 自动设置范围
-                self.range_min.setValue(self.x_data.min())
-                self.range_max.setValue(self.x_data.max())
-                
-                self.statusBar().showMessage(f'成功加载 {len(self.x_data)} 个数据点')
-                
+                success_count += 1
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"加载文件失败:\n{str(e)}")
+                print(f"Error loading {file_path}: {e}")
+                
+        if success_count > 0:
+            self.update_merged_data()
+            self.statusBar().showMessage(f'成功添加 {success_count} 个文件')
+        else:
+            QMessageBox.warning(self, "警告", "未添加任何新文件（可能格式错误或已存在）")
+
+    def remove_file(self):
+        """移除选中的文件"""
+        current_row = self.file_list_widget.currentRow()
+        if current_row < 0:
+            return
+            
+        # 从数据中移除
+        del self.loaded_files_data[current_row]
+        
+        # 从UI中移除
+        self.file_list_widget.takeItem(current_row)
+        
+        self.update_merged_data()
+        self.statusBar().showMessage('文件已移除')
+        
+    def clear_files(self):
+        """清空文件"""
+        self.loaded_files_data.clear()
+        self.file_list_widget.clear()
+        self.x_data = None
+        self.y_data = None
+        self.x_data_raw = None
+        self.y_data_raw = None
+        self.plot_canvas.axes.clear()
+        self.plot_canvas.draw()
+        self.current_file = None
+        self.statusBar().showMessage('列表已清空')
+
+    def update_merged_data(self):
+        """更新合并后的数据"""
+        if not self.loaded_files_data:
+            self.clear_files()
+            return
+            
+        # 提取所有数据进行拼接
+        datasets = [(d[1], d[2]) for d in self.loaded_files_data]
+        
+        try:
+            x_merged, y_merged = DataLoader.stitch_datasets(datasets)
+            
+            self.x_data_raw = x_merged
+            self.y_data_raw = y_merged
+            self.x_data_original = x_merged.copy()
+            self.y_data_original = y_merged.copy()
+            
+            # 更新当前文件名为第一个文件 + 标识
+            first_file = Path(self.loaded_files_data[0][0]).stem
+            if len(self.loaded_files_data) > 1:
+                self.current_file = f"{first_file}_merged_{len(self.loaded_files_data)}files"
+            else:
+                self.current_file = self.loaded_files_data[0][0]
+                
+            # 更新范围显示
+            self.range_min.setValue(x_merged.min())
+            self.range_max.setValue(x_merged.max())
+            
+            # 应用当前范围设置（这也将触发绘图更新）
+            self.apply_range()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"数据合并失败:\n{str(e)}")
+
+    def toggle_yscale(self):
+        """切换Y轴显示模式"""
+        if self.linear_radio.isChecked():
+            self.plot_canvas.set_yscale('linear')
+        else:
+            self.plot_canvas.set_yscale('log')
+
+
     
     def apply_range(self):
         """应用数据范围"""
@@ -794,6 +918,7 @@ class XRDAnalyzerGUI(QMainWindow):
         ax.set_xlabel('2θ (degree)', fontsize=12, fontweight='bold')
         ax.set_ylabel('Intensity (a.u.)', fontsize=12, fontweight='bold')
         ax.set_title('XRD Pattern Fitting', fontsize=14, fontweight='bold')
+        ax.set_yscale(self.plot_canvas.yscale)  # Keep consistent scale
         ax.legend(loc='best', fontsize=9, framealpha=0.9)
         ax.grid(True, alpha=0.3, linestyle='--')
         

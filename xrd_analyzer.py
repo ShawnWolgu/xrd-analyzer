@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy import signal, ndimage, optimize, fft
 from scipy.signal import find_peaks, savgol_filter
+from scipy.interpolate import interp1d
 import lmfit
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -80,6 +81,71 @@ class DataLoader:
         """裁剪数据范围"""
         mask = (x_data >= x_min) & (x_data <= x_max)
         return x_data[mask], y_data[mask]
+
+    @staticmethod
+    def stitch_datasets(datasets: List[Tuple[np.ndarray, np.ndarray]]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        拼接多个数据集 (Stitch multiple datasets)
+        
+        策略:
+        1. 确定整体的X范围
+        2. 生成均匀网格
+        3. 将每个数据集插值到网格上，未覆盖区域设为基线值(1e-5)
+        4. 重叠区域取平均
+        """
+        if not datasets:
+            return np.array([]), np.array([])
+            
+        if len(datasets) == 1:
+            return datasets[0]
+            
+        # 1. 确定全范围和步长
+        all_x = []
+        steps = []
+        
+        for x, y in datasets:
+            all_x.append(x)
+            if len(x) > 1:
+                # 取每个文件中间段的平均步长
+                steps.append(np.mean(np.diff(x)))
+                
+        x_concat = np.concatenate(all_x)
+        x_min, x_max = x_concat.min(), x_concat.max()
+        
+        # 确定平均步长
+        avg_step = np.mean(steps) if steps else 0.02
+        if avg_step <= 0 or np.isnan(avg_step):
+            avg_step = 0.02
+            
+        # 2. 生成均匀网格
+        num_points = int((x_max - x_min) / avg_step) + 1
+        x_uniform = np.linspace(x_min, x_max, num_points)
+        
+        # 3. 累积数据
+        y_accum = np.zeros_like(x_uniform)
+        weights = np.zeros_like(x_uniform)
+        
+        for x_src, y_src in datasets:
+            # 创建该数据集的插值函数
+            # bounds_error=False, fill_value=np.nan 让未覆盖区域为NaN
+            f = interp1d(x_src, y_src, kind='linear', bounds_error=False, fill_value=np.nan)
+            y_interp = f(x_uniform)
+            
+            # 找到有效值（非NaN）的掩码
+            valid_mask = ~np.isnan(y_interp)
+            
+            # 累积有效值
+            y_accum[valid_mask] += y_interp[valid_mask]
+            weights[valid_mask] += 1
+            
+        # 4. 计算最终结果
+        # 有数据的地方取平均
+        mask_data = weights > 0
+        y_final = np.ones_like(x_uniform) * 1e-5  # 默认填充基线值
+        
+        y_final[mask_data] = y_accum[mask_data] / weights[mask_data]
+        
+        return x_uniform, y_final
 
 
 class Preprocessor:
