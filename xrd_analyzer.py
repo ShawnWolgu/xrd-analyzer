@@ -521,17 +521,18 @@ class Reporter:
         print(f"Results exported to {output_path}")
         
     def plot_results(self, save_path: str = None, show_components: bool = True):
-        """绘制拟合结果"""
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), 
-                                       gridspec_kw={'height_ratios': [3, 1]})
+        """绘制拟合结果 (包含线性、对数和残差图)"""
+        # 创建3个子图: 线性, 对数, 残差
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), 
+                                       gridspec_kw={'height_ratios': [2, 2, 1]},
+                                       sharex=True)
         
-        # 主图
+        # --- 1. 线性坐标图 (Linear) ---
         ax1.scatter(self.fitter.x_data, self.fitter.y_data, 
                    s=10, alpha=0.6, label='Raw Data', color='gray')
         ax1.plot(self.fitter.x_data, self.fitter.y_fit, 
                 'r-', linewidth=2, label='Fit')
         
-        # 绘制各个峰的分量
         if show_components:
             peak_curves = self.fitter.get_individual_peaks()
             colors = plt.cm.tab10(np.linspace(0, 1, len(peak_curves)))
@@ -539,26 +540,65 @@ class Reporter:
             for i, (peak_id, curve) in enumerate(peak_curves.items()):
                 peak = self.fitter.peaks[peak_id]
                 label = f'Peak {peak_id} ({peak.peak_type})'
+                if peak.name:
+                    label += f': {peak.name}'
                 ax1.plot(self.fitter.x_data, curve, 
                         '--', color=colors[i], linewidth=1.5, 
                         alpha=0.7, label=label)
-        
-        ax1.set_xlabel('2θ (degree)', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Intensity (a.u.)', fontsize=12, fontweight='bold')
-        ax1.set_title('XRD Pattern Fitting', fontsize=14, fontweight='bold')
-        ax1.legend(loc='best', fontsize=9)
+
+        # 添加峰名注记 (Linear)
+        for peak in self.fitter.peaks:
+            label = peak.name if peak.name else f'P{peak.peak_id}'
+            # 使用拟合后的位置，如果还没拟合完则使用猜测值
+            center = peak.center if peak.center is not None else peak.center_guess
+            height = peak.height if peak.height is not None else 0
+            ax1.annotate(label, xy=(center, height), 
+                        xytext=(0, 10), textcoords='offset points',
+                        ha='center', va='bottom', fontsize=9, color='darkblue', fontweight='bold')
+
+        ax1.set_ylabel('Intensity (Linear)', fontsize=12, fontweight='bold')
+        ax1.set_title('XRD Pattern Fitting Results', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
+        # Legend outside right
+        ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.)
+
+        # --- 2. 对数坐标图 (Log) ---
+        ax2.scatter(self.fitter.x_data, self.fitter.y_data, 
+                   s=10, alpha=0.6, color='gray') # No label to avoid duplicate legend
+        ax2.plot(self.fitter.x_data, self.fitter.y_fit, 
+                'r-', linewidth=2)
         
-        # 残差图
-        residuals = self.fitter.y_data - self.fitter.y_fit
-        ax2.axhline(y=0, color='gray', linestyle='--', linewidth=1)
-        ax2.scatter(self.fitter.x_data, residuals, 
-                   s=5, alpha=0.5, color='blue')
-        ax2.set_xlabel('2θ (degree)', fontsize=10, fontweight='bold')
-        ax2.set_ylabel('Residuals', fontsize=10, fontweight='bold')
+        if show_components:
+            for i, (peak_id, curve) in enumerate(peak_curves.items()):
+                ax2.plot(self.fitter.x_data, curve, 
+                        '--', color=colors[i], linewidth=1.5, alpha=0.7)
+        
+        # 添加峰名注记 (Log)
+        for peak in self.fitter.peaks:
+            label = peak.name if peak.name else f'P{peak.peak_id}'
+            center = peak.center if peak.center is not None else peak.center_guess
+            height = peak.height if peak.height is not None else 0
+            # 只有当高度大于0时才标注，避免对数坐标报错
+            if height > 0:
+                ax2.annotate(label, xy=(center, height), 
+                            xytext=(0, 10), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=9, color='darkblue', fontweight='bold')
+
+        ax2.set_yscale('log')
+        ax2.set_ylabel('Intensity (Log)', fontsize=12, fontweight='bold')
         ax2.grid(True, alpha=0.3)
+        # 对数图不重复显示图例
+
+        # --- 3. 残差图 (Residuals) ---
+        residuals = self.fitter.y_data - self.fitter.y_fit
+        ax3.axhline(y=0, color='gray', linestyle='--', linewidth=1)
+        ax3.scatter(self.fitter.x_data, residuals, 
+                   s=5, alpha=0.5, color='blue')
+        ax3.set_xlabel('2θ (degree)', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('Residuals', fontsize=10, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
         
-        # 添加评估指标文本
+        # 添加评估指标文本 (to the first plot)
         metrics_text = f"R² = {self.metrics.get('R_squared', 0):.6f}\n"
         metrics_text += f"χ² = {self.metrics.get('Reduced_Chi_squared', 0):.4f}"
         ax1.text(0.02, 0.98, metrics_text, 
@@ -567,9 +607,17 @@ class Reporter:
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
                 fontsize=10)
         
+        # 强制设置X轴范围为数据范围
+        if self.fitter.x_data is not None:
+            x_min, x_max = self.fitter.x_data.min(), self.fitter.x_data.max()
+            ax1.set_xlim(x_min, x_max)
+            ax2.set_xlim(x_min, x_max)
+            ax3.set_xlim(x_min, x_max)
+            
         plt.tight_layout()
         
         if save_path:
+            # 使用 bbox_inches='tight' 确保外置图例被包含
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"Figure saved to {save_path}")
         

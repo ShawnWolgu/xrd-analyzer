@@ -236,6 +236,7 @@ class XRDAnalyzerGUI(QMainWindow):
         self.x_data_original = None  # 新增：最原始数据（加载时的）
         self.y_data_original = None  # 新增
         self.current_file = None
+        self.last_data_dir = None    # 新增：记录上次打开的数据文件夹
         
         # 多文件管理
         self.loaded_files_data = []  # List[Tuple[filepath, x, y]]
@@ -587,12 +588,17 @@ class XRDAnalyzerGUI(QMainWindow):
     
     def add_files(self):
         """添加文件"""
+        start_dir = self.last_data_dir if self.last_data_dir else ""
         file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择XRD数据文件", "", "Text Files (*.txt *.TXT)"
+            self, "选择XRD数据文件", start_dir, "Text Files (*.txt *.TXT)"
         )
         
         if not file_paths:
             return
+            
+        # 更新上次打开的文件夹
+        if file_paths:
+            self.last_data_dir = str(Path(file_paths[0]).parent)
             
         success_count = 0
         for file_path in file_paths:
@@ -863,15 +869,27 @@ class XRDAnalyzerGUI(QMainWindow):
 
     def import_peaks_from_file(self):
         """从文件导入峰列表"""
+        # 确定初始目录: 程序所在目录/database
+        program_dir = Path(__file__).parent.absolute()
+        database_dir = program_dir / "database"
+        start_dir = str(database_dir) if database_dir.exists() else str(program_dir)
+        
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "导入峰列表", "", "Text Files (*.txt);;All Files (*)"
+            self, "导入峰列表", start_dir, "Text Files (*.txt);;All Files (*)"
         )
         
         if not file_path:
             return
             
+        # 获取当前X轴范围
+        x_min, x_max = -np.inf, np.inf
+        if self.x_data is not None:
+            x_min = self.x_data.min()
+            x_max = self.x_data.max()
+            
         try:
             count = 0
+            skipped = 0
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
@@ -884,6 +902,11 @@ class XRDAnalyzerGUI(QMainWindow):
                         
                     try:
                         center = float(parts[0])
+                        
+                        # 检查范围
+                        if center < x_min or center > x_max:
+                            skipped += 1
+                            continue
                         
                         peak_type = 'film'
                         if len(parts) >= 2:
@@ -900,7 +923,10 @@ class XRDAnalyzerGUI(QMainWindow):
                     except ValueError:
                         continue
                         
-            self.statusBar().showMessage(f"成功导入 {count} 个峰")
+            msg = f"成功导入 {count} 个峰"
+            if skipped > 0:
+                msg += f" (已忽略 {skipped} 个超出范围的峰)"
+            self.statusBar().showMessage(msg)
             
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"错误: {str(e)}")
@@ -1180,9 +1206,13 @@ class XRDAnalyzerGUI(QMainWindow):
             default_name = "xrd_analysis_results.xlsx"
         else:
             default_name = Path(self.current_file).stem + "_results.xlsx"
+            
+        # 使用上次的数据文件夹作为起点
+        start_dir = self.last_data_dir if self.last_data_dir else ""
+        default_path = os.path.join(start_dir, default_name)
         
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存Excel报告", default_name, "Excel Files (*.xlsx)"
+            self, "保存Excel报告", default_path, "Excel Files (*.xlsx)"
         )
         
         if file_path:
@@ -1202,9 +1232,13 @@ class XRDAnalyzerGUI(QMainWindow):
             default_name = "xrd_fitting.png"
         else:
             default_name = Path(self.current_file).stem + "_fitting.png"
+            
+        # 使用上次的数据文件夹作为起点
+        start_dir = self.last_data_dir if self.last_data_dir else ""
+        default_path = os.path.join(start_dir, default_name)
         
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存图片", default_name, 
+            self, "保存图片", default_path, 
             "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)"
         )
         
