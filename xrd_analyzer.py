@@ -313,8 +313,14 @@ class Fitter:
                 new_min = max(current_min, p1.center_guess + min_peak_separation)
                 self.params[f'p{p2.peak_id}_center'].set(min=new_min)
         
-    def execute_fitting(self, method: str = 'leastsq') -> lmfit.model.ModelResult:
-        """执行拟合"""
+    def execute_fitting(self, method: str = 'leastsq', use_log_scale: bool = True) -> lmfit.model.ModelResult:
+        """
+        执行拟合
+        
+        Args:
+            method: 拟合方法
+            use_log_scale: 是否使用对数尺度 (True: 混合对数/线性, False: 纯线性)
+        """
         if self.model is None:
             self.build_model()
 
@@ -324,18 +330,53 @@ class Fitter:
             prefix = f'p{peak.peak_id}_'
             print(f"  Peak {peak.peak_id} sigma: {self.params[f'{prefix}sigma'].value}, vary={self.params[f'{prefix}sigma'].vary}")
         
-        self.result = self.model.fit(self.y_data, 
-                                     self.params, 
-                                     x=self.x_data,
-                                     method=method)
+        if use_log_scale:
+            # 混合损失函数: 80% Log + 20% Linear
+            def mixed_residual(params, model, x, data):
+                model_vals = model.eval(params, x=x)
+                eps = 1e-6
+                
+                # Log residual (Log10 difference)
+                res_log = np.log10(np.maximum(data, eps)) - np.log10(np.maximum(model_vals, eps))
+                res_log = np.nan_to_num(res_log)
+                
+                # Linear residual (Normalized by max intensity)
+                max_val = np.max(data) if np.max(data) > 0 else 1.0
+                res_lin = (data - model_vals) / max_val
+                
+                # Weights: 80% Log, 20% Linear (applied as sqrt since leastsq minimizes sum of squares)
+                w_log = np.sqrt(0.8)
+                w_lin = np.sqrt(0.2)
+                
+                # Concatenate weighted residuals
+                return np.concatenate([w_log * res_log, w_lin * res_lin])
+
+            print(f"Executing fitting with MIXED optimization (80% Log + 20% Linear, method={method})...")
+            self.result = lmfit.minimize(mixed_residual, 
+                                       self.params, 
+                                       args=(self.model, self.x_data, self.y_data),
+                                       method=method)
+            
+            # 手动计算拟合曲线
+            self.y_fit = self.model.eval(self.result.params, x=self.x_data)
+            
+        else:
+            print(f"Executing fitting with linear scale optimization (method={method})...")
+            self.result = self.model.fit(self.y_data, 
+                                         self.params, 
+                                         x=self.x_data,
+                                         method=method)
+            self.y_fit = self.result.best_fit
         
         print("\nFitted parameters:")
         for peak in self.peaks:
             prefix = f'p{peak.peak_id}_'
             print(f"  Peak {peak.peak_id} sigma: {self.result.params[f'{prefix}sigma'].value}")
         
-        self.y_fit = self.result.best_fit
-        
+        # 确保 y_fit 是最新的
+        if self.y_fit is None:
+             self.y_fit = self.model.eval(self.result.params, x=self.x_data)
+
         # 更新各峰的参数
         for peak in self.peaks:
             peak.set_result(self.result.params)
@@ -349,12 +390,24 @@ class Fitter:
             return {}
         
         peak_curves = {}
+        
+        # 兼容ModelResult和MinimizerResult
+        if hasattr(self.result, 'eval_components'):
+             components = self.result.eval_components(x=self.x_data)
+        else:
+             components = self.model.eval_components(params=self.result.params, x=self.x_data)
+
         for peak in self.peaks:
             prefix = f'p{peak.peak_id}_'
-            components = self.result.eval_components(x=self.x_data)
             peak_curves[peak.peak_id] = components[prefix]
         
         return peak_curves
+
+    def get_fit_report(self) -> str:
+        """获取拟合报告"""
+        if self.result is None:
+            return "No fit result available."
+        return lmfit.fit_report(self.result)
 
 
 class Reporter:
@@ -446,13 +499,24 @@ class Reporter:
     
     def export_results(self, output_path: str):
         """导出结果到Excel（包含原始数据和处理后数据）"""
+        # 计算晶格参数以便获取d-spacing和四方度
+        lattice_params = self.calculate_lattice_parameters()
+        
         results_list = []
         
         for peak in self.fitter.peaks:
+            # 从lattice_params中获取d_spacing
+            d_spacing = None
+            peak_key = f'Peak_{peak.peak_id}'
+            if peak_key in lattice_params:
+                d_spacing = lattice_params[peak_key].get('d_spacing')
+
             results_list.append({
                 'Peak_ID': peak.peak_id,
+                'Name': peak.name,          # 新增: 峰名称
                 'Type': peak.peak_type,
                 'Center_2theta': peak.center,
+                'd_spacing_Å': d_spacing,   # 新增: d间距
                 'FWHM': peak.fwhm,
                 'Height': peak.height,
                 'Area': peak.area,
@@ -464,8 +528,16 @@ class Reporter:
         # 评估指标
         metrics_df = pd.DataFrame([self.metrics])
         
-        # 晶格参数
-        lattice_params = self.calculate_lattice_parameters()
+        # 结构分析参数 (如 Tetragonality) - 单独放入一张表，避免压扁在一行
+        structure_list = []
+        if 'Tetragonality' in lattice_params:
+            tet = lattice_params['Tetragonality']
+            structure_list.append({
+                'Parameter': 'Tetragonality',
+                'c_axis': tet.get('c_axis'),
+                'a_axis': tet.get('a_axis'),
+                'c/a_ratio': tet.get('c/a_ratio')
+            })
         
         # 完整数据表
         data_dict = {
@@ -503,17 +575,10 @@ class Reporter:
             df_peaks.to_excel(writer, sheet_name='Peak_Parameters', index=False)
             metrics_df.to_excel(writer, sheet_name='Fit_Metrics', index=False)
             
-            # 晶格参数
-            if lattice_params:
-                lattice_flat = {}
-                for key, value in lattice_params.items():
-                    if isinstance(value, dict):
-                        for k, v in value.items():
-                            lattice_flat[f"{key}_{k}"] = v
-                    else:
-                        lattice_flat[key] = value
-                lattice_df = pd.DataFrame([lattice_flat])
-                lattice_df.to_excel(writer, sheet_name='Lattice_Parameters', index=False)
+            # 结构分析参数
+            if structure_list:
+                df_structure = pd.DataFrame(structure_list)
+                df_structure.to_excel(writer, sheet_name='Structure_Analysis', index=False)
             
             # 完整数据
             df_data.to_excel(writer, sheet_name='Full_Data', index=False)

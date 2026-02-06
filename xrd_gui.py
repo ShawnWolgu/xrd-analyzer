@@ -306,9 +306,16 @@ class XRDAnalyzerGUI(QMainWindow):
         remove_btn.clicked.connect(self.remove_file)
         btn_layout.addWidget(remove_btn)
         
-        clear_btn = QPushButton("清空")
+        clear_btn = QPushButton("清空文件")
         clear_btn.clicked.connect(self.clear_files)
         btn_layout.addWidget(clear_btn)
+        
+        # 新增：重置/刷新按钮
+        app_reset_btn = QPushButton("重置系统")
+        app_reset_btn.setToolTip("清除所有数据、峰和结果，恢复初始状态")
+        app_reset_btn.setStyleSheet("color: red; font-weight: bold;")
+        app_reset_btn.clicked.connect(self.reset_app)
+        btn_layout.addWidget(app_reset_btn)
         
         file_layout.addLayout(btn_layout)
         
@@ -366,7 +373,7 @@ class XRDAnalyzerGUI(QMainWindow):
         sg_layout.addWidget(QLabel("窗口长度:"))
         self.sg_window = QSpinBox()
         self.sg_window.setRange(3, 51)
-        self.sg_window.setValue(11)
+        self.sg_window.setValue(7)
         self.sg_window.setSingleStep(2)
         sg_layout.addWidget(self.sg_window)
         preprocess_layout.addLayout(sg_layout)
@@ -648,10 +655,52 @@ class XRDAnalyzerGUI(QMainWindow):
         self.y_data = None
         self.x_data_raw = None
         self.y_data_raw = None
+        self.x_data_original = None
+        self.y_data_original = None
         self.plot_canvas.axes.clear()
         self.plot_canvas.draw()
         self.current_file = None
+        
+        # 同时也应该清除fitter，因为数据没了
+        self.fitter = None
+        
         self.statusBar().showMessage('列表已清空')
+
+    def reset_app(self):
+        """重置整个应用状态"""
+        reply = QMessageBox.question(
+            self, '确认重置', 
+            "确定要重置系统吗？\n这将清除所有已加载的数据、峰设置和拟合结果。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # 1. 清除文件和数据
+            self.clear_files()
+            
+            # 2. 清除峰
+            self.clear_all_peaks() # 这会处理 self.fitter.peaks 和 UI
+            
+            # 3. 强制销毁对象
+            self.fitter = None
+            self.reporter = None
+            
+            # 4. 清除结果显示
+            self.results_text.clear()
+            self.physics_text.clear()
+            
+            # 5. 重置UI控件状态
+            self.manual_peak_btn.setChecked(False)
+            self.plot_canvas.mode = 'view'
+            self.manual_peak_btn.setText("手动添加峰 (点击图上)")
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setValue(0)
+            
+            # 6. 重置范围控件 (可选，恢复默认值)
+            self.range_min.setValue(20)
+            self.range_max.setValue(120)
+            
+            self.statusBar().showMessage('系统已重置，就绪')
 
     def update_merged_data(self):
         """更新合并后的数据"""
@@ -1126,7 +1175,7 @@ class XRDAnalyzerGUI(QMainWindow):
         text += "\n" + "=" * 60 + "\n"
         text += "【Lmfit拟合报告】\n"
         text += "=" * 60 + "\n"
-        text += self.fitter.result.fit_report()
+        text += self.fitter.get_fit_report()
         
         self.results_text.setPlainText(text)
     
