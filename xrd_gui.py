@@ -194,11 +194,12 @@ class FittingThread(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
     
-    def __init__(self, fitter, constrain_fwhm, min_separation):
+    def __init__(self, fitter, constrain_fwhm, min_separation, log_weight=0.5):
         super().__init__()
         self.fitter = fitter
         self.constrain_fwhm = constrain_fwhm
         self.min_separation = min_separation
+        self.log_weight = log_weight
         
     def run(self):
         try:
@@ -213,7 +214,7 @@ class FittingThread(QThread):
             self.progress.emit(40)
             
             # 执行拟合
-            result = self.fitter.execute_fitting()
+            result = self.fitter.execute_fitting(log_weight=self.log_weight)
             
             self.progress.emit(100)
             self.finished.emit(result)
@@ -285,11 +286,17 @@ class XRDAnalyzerGUI(QMainWindow):
     def create_left_panel(self):
         """创建左侧控制面板"""
         panel = QWidget()
-        # 改为水平布局以容纳两列
-        main_layout = QHBoxLayout()
+        # 改为垂直布局：上部为两列，下部为宽大的峰管理区
+        main_layout = QVBoxLayout()
         panel.setLayout(main_layout)
         
-        # === 左列：数据加载与预处理 ===
+        # === 上部区域 (两列布局) ===
+        top_section = QWidget()
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_section.setLayout(top_layout)
+        
+        # --- 左上列：数据加载与预处理 ---
         col1_layout = QVBoxLayout()
         
         # 1. 文件加载组
@@ -405,14 +412,115 @@ class XRDAnalyzerGUI(QMainWindow):
         
         preprocess_group.setLayout(preprocess_layout)
         col1_layout.addWidget(preprocess_group)
+        col1_layout.addStretch() # 确保紧凑
         
-        col1_layout.addStretch()
-        main_layout.addLayout(col1_layout)
+        top_layout.addLayout(col1_layout)
         
-        # === 右列：峰管理与拟合 ===
+        # --- 右上列：拟合配置与导出 (原Group 4 & 5) ---
         col2_layout = QVBoxLayout()
         
-        # 3. 峰管理组
+        # 4. 拟合配置组 (原 Group 4)
+        fit_group = QGroupBox("4. 拟合配置")
+        fit_layout = QVBoxLayout()
+        
+        # 约束选项
+        self.constrain_fwhm_cb = QCheckBox("强制薄膜峰FWHM相等")
+        fit_layout.addWidget(self.constrain_fwhm_cb)
+        
+        # 最小峰间距
+        separation_layout = QHBoxLayout()
+        separation_layout.addWidget(QLabel("最小峰间距:"))
+        self.min_separation = QDoubleSpinBox()
+        self.min_separation.setRange(0, 5)
+        self.min_separation.setValue(0.2)
+        self.min_separation.setSingleStep(0.05)
+        self.min_separation.setDecimals(3)
+        separation_layout.addWidget(self.min_separation)
+        fit_layout.addLayout(separation_layout)
+        
+        # 拟合方法
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("拟合方法:"))
+        self.fit_method_combo = QComboBox()
+        self.fit_method_combo.addItems(['leastsq', 'least_squares', 'nelder'])
+        method_layout.addWidget(self.fit_method_combo)
+        fit_layout.addLayout(method_layout)
+        
+        # 优化权重 (Log/Linear)
+        weight_layout = QHBoxLayout()
+        weight_layout.addWidget(QLabel("Log权重:"))
+        
+        self.log_weight_slider = QSpinBox() # 使用SpinBox简单直观，或者Slider+SpinBox联动
+        from PyQt5.QtWidgets import QSlider # 确保引入
+        
+        self.log_slider = QSlider(Qt.Horizontal)
+        self.log_slider.setRange(0, 100)
+        self.log_slider.setValue(50)
+        self.log_slider.setSingleStep(10)
+        
+        self.log_spin = QSpinBox()
+        self.log_spin.setRange(0, 100)
+        self.log_spin.setValue(50)
+        self.log_spin.setSuffix("%")
+        
+        # 联动
+        self.log_slider.valueChanged.connect(self.log_spin.setValue)
+        self.log_spin.valueChanged.connect(self.log_slider.setValue)
+        
+        weight_layout.addWidget(self.log_slider)
+        weight_layout.addWidget(self.log_spin)
+        fit_layout.addLayout(weight_layout)
+        
+        # 执行拟合按钮
+        execute_fit_btn = QPushButton("执行拟合")
+        execute_fit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        execute_fit_btn.clicked.connect(self.execute_fitting)
+        fit_layout.addWidget(execute_fit_btn)
+        
+        # 优化拟合按钮 (Refine Fit)
+        refine_fit_btn = QPushButton("基于当前结果优化拟合 (Refine)")
+        refine_fit_btn.setToolTip("使用上一次的拟合结果作为初始值，并应用表格中的锁定设置进行再拟合")
+        refine_fit_btn.setStyleSheet("color: blue; font-weight: bold;")
+        refine_fit_btn.clicked.connect(self.refine_fitting)
+        fit_layout.addWidget(refine_fit_btn)
+        
+        fit_group.setLayout(fit_layout)
+        col2_layout.addWidget(fit_group)
+        
+        # 5. 结果导出组 (原 Group 5)
+        export_group = QGroupBox("5. 结果导出")
+        export_layout = QVBoxLayout()
+        
+        export_excel_btn = QPushButton("导出Excel报告")
+        export_excel_btn.clicked.connect(self.export_excel)
+        export_layout.addWidget(export_excel_btn)
+        
+        export_figure_btn = QPushButton("导出高清图片")
+        export_figure_btn.clicked.connect(self.export_figure)
+        export_layout.addWidget(export_figure_btn)
+        
+        export_group.setLayout(export_layout)
+        col2_layout.addWidget(export_group)
+        col2_layout.addStretch() # 确保紧凑
+        
+        top_layout.addLayout(col2_layout)
+        
+        # 添加上部区域到主布局
+        main_layout.addWidget(top_section)
+        
+        # === 下部区域：峰管理 (全宽) ===
+        
+        # 3. 峰管理组 (原 Group 3)
         peak_group = QGroupBox("3. 峰识别与管理")
         peak_layout = QVBoxLayout()
         
@@ -458,85 +566,35 @@ class XRDAnalyzerGUI(QMainWindow):
         self.peak_table = QTableWidget()
         self.peak_table.setColumnCount(6)
         self.peak_table.setHorizontalHeaderLabels(
-            ['ID', '名称', '中心', '最小', '最大', '类型']
+            ['ID', '名称', '位置 (Pos)', '高度 (Height)', 'FWHM', '类型']
         )
         self.peak_table.setMinimumHeight(200)
+        
+        # 设置列宽
+        self.peak_table.setColumnWidth(0, 40) # ID
+        self.peak_table.setColumnWidth(1, 80) # Name
+        self.peak_table.setColumnWidth(2, 100) # Pos
+        self.peak_table.setColumnWidth(3, 100) # Height
+        self.peak_table.setColumnWidth(4, 100) # FWHM
+        self.peak_table.setColumnWidth(5, 80) # Type
+        
         peak_layout.addWidget(self.peak_table)
         
         # 删除峰按钮
+        peak_btn_layout = QHBoxLayout()
         delete_peak_btn = QPushButton("删除选中峰")
         delete_peak_btn.clicked.connect(self.delete_selected_peak)
-        peak_layout.addWidget(delete_peak_btn)
+        peak_btn_layout.addWidget(delete_peak_btn)
         
         clear_peaks_btn = QPushButton("清除所有峰")
         clear_peaks_btn.clicked.connect(self.clear_all_peaks)
-        peak_layout.addWidget(clear_peaks_btn)
+        peak_btn_layout.addWidget(clear_peaks_btn)
+        peak_layout.addLayout(peak_btn_layout)
         
         peak_group.setLayout(peak_layout)
-        col2_layout.addWidget(peak_group, 1) # 让其占据多余空间
         
-        # 4. 拟合配置组
-        fit_group = QGroupBox("4. 拟合配置")
-        fit_layout = QVBoxLayout()
-        
-        # 约束选项
-        self.constrain_fwhm_cb = QCheckBox("强制薄膜峰FWHM相等")
-        fit_layout.addWidget(self.constrain_fwhm_cb)
-        
-        # 最小峰间距
-        separation_layout = QHBoxLayout()
-        separation_layout.addWidget(QLabel("最小峰间距:"))
-        self.min_separation = QDoubleSpinBox()
-        self.min_separation.setRange(0, 5)
-        self.min_separation.setValue(0.2)
-        self.min_separation.setSingleStep(0.05)
-        self.min_separation.setDecimals(3)
-        separation_layout.addWidget(self.min_separation)
-        fit_layout.addLayout(separation_layout)
-        
-        # 拟合方法
-        method_layout = QHBoxLayout()
-        method_layout.addWidget(QLabel("拟合方法:"))
-        self.fit_method_combo = QComboBox()
-        self.fit_method_combo.addItems(['leastsq', 'least_squares', 'nelder'])
-        method_layout.addWidget(self.fit_method_combo)
-        fit_layout.addLayout(method_layout)
-        
-        # 执行拟合按钮
-        execute_fit_btn = QPushButton("执行拟合")
-        execute_fit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
-        execute_fit_btn.clicked.connect(self.execute_fitting)
-        fit_layout.addWidget(execute_fit_btn)
-        
-        fit_group.setLayout(fit_layout)
-        col2_layout.addWidget(fit_group)
-        
-        # 5. 结果导出组
-        export_group = QGroupBox("5. 结果导出")
-        export_layout = QVBoxLayout()
-        
-        export_excel_btn = QPushButton("导出Excel报告")
-        export_excel_btn.clicked.connect(self.export_excel)
-        export_layout.addWidget(export_excel_btn)
-        
-        export_figure_btn = QPushButton("导出高清图片")
-        export_figure_btn.clicked.connect(self.export_figure)
-        export_layout.addWidget(export_figure_btn)
-        
-        export_group.setLayout(export_layout)
-        col2_layout.addWidget(export_group)
-        
-        main_layout.addLayout(col2_layout)
+        # 添加峰管理组到主布局，并给予伸缩因子1，使其占据剩余空间
+        main_layout.addWidget(peak_group, 1)
         
         return panel
     
@@ -873,11 +931,40 @@ class XRDAnalyzerGUI(QMainWindow):
         self.peak_table.setRowCount(len(self.fitter.peaks))
         
         for i, peak in enumerate(self.fitter.peaks):
+            # 0. ID
             self.peak_table.setItem(i, 0, QTableWidgetItem(str(peak.peak_id)))
+            
+            # 1. 名称
             self.peak_table.setItem(i, 1, QTableWidgetItem(peak.name))
-            self.peak_table.setItem(i, 2, QTableWidgetItem(f"{peak.center_guess:.3f}"))
-            self.peak_table.setItem(i, 3, QTableWidgetItem(f"{peak.bounds[0]:.3f}"))
-            self.peak_table.setItem(i, 4, QTableWidgetItem(f"{peak.bounds[1]:.3f}"))
+            
+            # 2. 位置 (Pos) - 总是显示猜测值或结果值
+            center_val = peak.center if peak.center is not None else peak.center_guess
+            item_pos = QTableWidgetItem(f"{center_val:.3f}")
+            item_pos.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_pos.setCheckState(Qt.Checked if peak.fixed_center else Qt.Unchecked)
+            self.peak_table.setItem(i, 2, item_pos)
+            
+            # 3. 高度 (Height) - 拟合前NaN
+            if peak.height is not None:
+                val_str = f"{peak.height:.2f}"
+            else:
+                val_str = "NaN"
+            item_h = QTableWidgetItem(val_str)
+            item_h.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_h.setCheckState(Qt.Checked if peak.fixed_height else Qt.Unchecked)
+            self.peak_table.setItem(i, 3, item_h)
+            
+            # 4. FWHM - 拟合前NaN
+            if peak.fwhm is not None:
+                val_str = f"{peak.fwhm:.4f}"
+            else:
+                val_str = "NaN"
+            item_w = QTableWidgetItem(val_str)
+            item_w.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_w.setCheckState(Qt.Checked if peak.fixed_fwhm else Qt.Unchecked)
+            self.peak_table.setItem(i, 4, item_w)
+            
+            # 5. 类型
             self.peak_table.setItem(i, 5, QTableWidgetItem(peak.peak_type))
     
     def quick_add_peak(self):
@@ -1019,21 +1106,59 @@ class XRDAnalyzerGUI(QMainWindow):
             self.update_peak_table()
             self.plot_canvas.clear_peak_markers()
     
+    def sync_table_to_peaks(self):
+        """将表格中的锁定状态同步回Peak对象"""
+        if self.fitter is None:
+            return
+            
+        for i in range(self.peak_table.rowCount()):
+            peak_id = int(self.peak_table.item(i, 0).text())
+            # 找到对应的peak对象 (peak_id可能不等于索引，如果删除过)
+            peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
+            if peak:
+                # 现在的复选框集成在 2, 3, 4 列中
+                peak.fixed_center = (self.peak_table.item(i, 2).checkState() == Qt.Checked)
+                peak.fixed_height = (self.peak_table.item(i, 3).checkState() == Qt.Checked)
+                peak.fixed_fwhm = (self.peak_table.item(i, 4).checkState() == Qt.Checked)
+
+    def refine_fitting(self):
+        """基于当前结果优化拟合"""
+        if self.fitter is None or self.fitter.result is None:
+            QMessageBox.warning(self, "警告", "请先执行一次常规拟合")
+            return
+            
+        # 1. 同步锁定状态
+        self.sync_table_to_peaks()
+        
+        # 2. 更新猜测值
+        self.fitter.update_guesses_from_result()
+        
+        # 3. 重新执行拟合
+        # 注意：这里我们不需要清除result，execute_fitting会创建新的model
+        self.statusBar().showMessage('正在优化拟合...')
+        self.execute_fitting()
+
     def execute_fitting(self):
         """执行拟合"""
         if self.fitter is None or len(self.fitter.peaks) == 0:
             QMessageBox.warning(self, "警告", "请先添加峰")
             return
+            
+        # 确保锁定状态同步（即使是初次拟合，用户也可能先勾选了锁定）
+        self.sync_table_to_peaks()
         
         # 显示进度条
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
         # 创建拟合线程
+        log_weight = self.log_spin.value() / 100.0
+        
         self.fit_thread = FittingThread(
             self.fitter,
             self.constrain_fwhm_cb.isChecked(),
-            self.min_separation.value()
+            self.min_separation.value(),
+            log_weight=log_weight
         )
         
         self.fit_thread.progress.connect(self.progress_bar.setValue)
@@ -1057,6 +1182,9 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 更新绘图
         self.plot_fitted_results()
+        
+        # 更新峰列表表格
+        self.update_peak_table()
         
         # 显示结果
         self.display_results()

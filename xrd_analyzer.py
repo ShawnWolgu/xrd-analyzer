@@ -26,6 +26,10 @@ class Peak:
         self.peak_type = peak_type  # 'film' or 'substrate'
         self.name = name
         
+        # 初始猜测缓存 (用于Refine模式)
+        self.sigma_guess = None
+        self.height_guess = None
+        
         # 拟合结果
         self.center = None
         self.height = None
@@ -33,18 +37,42 @@ class Peak:
         self.area = None
         self.eta = None  # Pseudo-Voigt混合参数
         
-    def set_result(self, params: Dict):
+        # 锁定状态
+        self.fixed_center = False
+        self.fixed_height = False
+        self.fixed_fwhm = False
+        
+    def set_result(self, params: Dict, fitted_height: float = None):
         """从lmfit结果设置参数"""
         prefix = f'p{self.peak_id}_'
+        
         self.center = params[f'{prefix}center'].value
-        self.height = params[f'{prefix}amplitude'].value
-        self.fwhm = params[f'{prefix}sigma'].value * 2.355  # 转换为FWHM
-            # 修改这一行：
+        amplitude = params[f'{prefix}amplitude'].value
+        sigma = params[f'{prefix}sigma'].value
+        
+        # 转换为FWHM
+        # Gaussian FWHM = 2.3548 * sigma
+        # Lorentzian FWHM = 2 * sigma
+        # Pseudo-Voigt FWHM is an approximation
+        self.fwhm = sigma * 2.3548 
+        
         fraction_param = params.get(f'{prefix}fraction')
         if fraction_param is not None:
             self.eta = fraction_param.value
         else:
-            self.eta = 0.5  # 默认值
+            self.eta = 0.5
+            
+        # 优先使用传入的直接计算高度，否则使用公式估算
+        if fitted_height is not None:
+            self.height = fitted_height
+        else:
+            # Formula: H = (A / sigma) * [ (1-eta)/sqrt(2*pi) + eta/pi ]
+            term1 = (1 - self.eta) / np.sqrt(2 * np.pi)
+            term2 = self.eta / np.pi
+            self.height = (amplitude / sigma) * (term1 + term2)
+        
+        # 将Area设置为Amplitude (Analytical Area)
+        self.area = amplitude
         
     def calculate_area(self, x_data: np.ndarray, y_data: np.ndarray) -> float:
         """计算峰面积"""
@@ -242,6 +270,34 @@ class Fitter:
         for i, peak in enumerate(self.peaks):
             peak.peak_id = i
     
+    def update_guesses_from_result(self):
+        """将上一次拟合结果更新为下一次的初始猜测"""
+        if self.result is None:
+            return
+            
+        params = self.result.params
+        for peak in self.peaks:
+            prefix = f'p{peak.peak_id}_'
+            
+            # 获取拟合结果
+            center = params[f'{prefix}center'].value
+            sigma = params[f'{prefix}sigma'].value
+            # amplitude在PseudoVoigtModel中稍微复杂，因为它不仅取决于高度
+            # 但我们可以直接用拟合后的height属性（如果已经计算）或者直接用parameter
+            # 这里我们简单地更新 center_guess 和 bounds
+            
+            peak.center_guess = center
+            # 缩小bounds范围以集中搜索? 或者保持原bounds? 
+            # 保持原bounds比较安全，但更新guess是关键
+            
+            # 更新bounds中心，保持宽度不变
+            width = peak.bounds[1] - peak.bounds[0]
+            peak.bounds = (center - width/2, center + width/2)
+            
+            # 保存Sigma和Amplitude作为下一次的猜测
+            peak.sigma_guess = sigma
+            peak.height_guess = params[f'{prefix}amplitude'].value
+    
     def auto_find_peaks(self, height_threshold: float = None,
                        distance: int = 10) -> List[float]:
         """自动寻峰"""
@@ -272,23 +328,39 @@ class Fitter:
             pars = peak_model.make_params()
             pars[f'{prefix}center'].set(value=peak.center_guess, 
                                        min=peak.bounds[0], 
-                                       max=peak.bounds[1])
+                                       max=peak.bounds[1],
+                                       vary=not peak.fixed_center) # 尊重锁定设置
             
             # 估算初始高度
-            idx = np.argmin(np.abs(self.x_data - peak.center_guess))
-            initial_height = self.y_data[idx]
-            pars[f'{prefix}amplitude'].set(value=initial_height, min=0)
+            if peak.height_guess is not None:
+                initial_height = peak.height_guess
+            else:
+                idx = np.argmin(np.abs(self.x_data - peak.center_guess))
+                initial_height = self.y_data[idx]
             
-            # FWHM约束 - 关键修改：确保vary=True
-            if peak.peak_type == 'substrate':
+            pars[f'{prefix}amplitude'].set(value=initial_height, min=0,
+                                          vary=not peak.fixed_height) # 尊重锁定设置
+            
+            # FWHM约束 - 关键修改：确保vary=True，除非被锁定
+            is_sigma_vary = not peak.fixed_fwhm
+            
+            if peak.sigma_guess is not None:
+                # 如果有之前的拟合结果，优先使用
+                initial_sigma = peak.sigma_guess
+            elif peak.peak_type == 'substrate':
                 # 基底峰通常很窄
-                pars[f'{prefix}sigma'].set(value=0.05, min=0.01, max=1.0, vary=True)  # 添加vary=True
+                initial_sigma = 0.05
             else:
                 # 薄膜峰较宽
-                pars[f'{prefix}sigma'].set(value=0.15, min=0.01, max=1.5, vary=True)  # 添加vary=True
+                initial_sigma = 0.15
+                
+            if peak.peak_type == 'substrate':
+                 pars[f'{prefix}sigma'].set(value=initial_sigma, min=0.01, max=1.0, vary=is_sigma_vary)
+            else:
+                 pars[f'{prefix}sigma'].set(value=initial_sigma, min=0.01, max=1.5, vary=is_sigma_vary)
             
             # Pseudo-Voigt混合参数
-            pars[f'{prefix}fraction'].set(value=0.5, min=0, max=1, vary=True)  # 添加vary=True
+            pars[f'{prefix}fraction'].set(value=0.5, min=0, max=1, vary=True)
             
             self.params.update(pars)
         
@@ -313,13 +385,14 @@ class Fitter:
                 new_min = max(current_min, p1.center_guess + min_peak_separation)
                 self.params[f'p{p2.peak_id}_center'].set(min=new_min)
         
-    def execute_fitting(self, method: str = 'leastsq', use_log_scale: bool = True) -> lmfit.model.ModelResult:
+    def execute_fitting(self, method: str = 'leastsq', use_log_scale: bool = True, log_weight: float = 0.5) -> lmfit.model.ModelResult:
         """
         执行拟合
         
         Args:
             method: 拟合方法
             use_log_scale: 是否使用对数尺度 (True: 混合对数/线性, False: 纯线性)
+            log_weight: 对数权重的比例 (0.0 - 1.0), 线性权重为 1.0 - log_weight
         """
         if self.model is None:
             self.build_model()
@@ -331,7 +404,11 @@ class Fitter:
             print(f"  Peak {peak.peak_id} sigma: {self.params[f'{prefix}sigma'].value}, vary={self.params[f'{prefix}sigma'].vary}")
         
         if use_log_scale:
-            # 混合损失函数: 80% Log + 20% Linear
+            # 混合损失函数
+            # 权重动态计算
+            w_log = np.sqrt(log_weight)
+            w_lin = np.sqrt(1.0 - log_weight)
+            
             def mixed_residual(params, model, x, data):
                 model_vals = model.eval(params, x=x)
                 eps = 1e-6
@@ -344,14 +421,10 @@ class Fitter:
                 max_val = np.max(data) if np.max(data) > 0 else 1.0
                 res_lin = (data - model_vals) / max_val
                 
-                # Weights: 80% Log, 20% Linear (applied as sqrt since leastsq minimizes sum of squares)
-                w_log = np.sqrt(0.8)
-                w_lin = np.sqrt(0.2)
-                
                 # Concatenate weighted residuals
                 return np.concatenate([w_log * res_log, w_lin * res_lin])
 
-            print(f"Executing fitting with MIXED optimization (80% Log + 20% Linear, method={method})...")
+            print(f"Executing fitting with MIXED optimization ({log_weight:.2%} Log + {1-log_weight:.2%} Linear, method={method})...")
             self.result = lmfit.minimize(mixed_residual, 
                                        self.params, 
                                        args=(self.model, self.x_data, self.y_data),
@@ -377,10 +450,40 @@ class Fitter:
         if self.y_fit is None:
              self.y_fit = self.model.eval(self.result.params, x=self.x_data)
 
+        # 获取各组件的独立曲线以便精确计算峰高
+        if hasattr(self.result, 'eval_components'):
+             components = self.result.eval_components(x=self.x_data)
+        else:
+             components = self.model.eval_components(params=self.result.params, x=self.x_data)
+
         # 更新各峰的参数
         for peak in self.peaks:
-            peak.set_result(self.result.params)
-            peak.calculate_area(self.x_data, self.y_fit)
+            # 从组件曲线中获取峰中心处的高度
+            prefix = f'p{peak.peak_id}_'
+            if prefix in components:
+                # 找到最接近中心的数据点索引
+                center_val = self.result.params[f'{prefix}center'].value
+                idx = np.argmin(np.abs(self.x_data - center_val))
+                # 或者更精确地，评估该组件在center处的值
+                # 这里我们简单取最接近点的组件值作为高度近似，
+                # 或者为了更精确，我们可以重新evaluate component at single point x=center
+                
+                # 方法2: 精确计算
+                peak_model = lmfit.models.PseudoVoigtModel(prefix=prefix)
+                # 构造只包含该峰参数的字典
+                peak_params = peak_model.make_params()
+                for p_name in peak_params:
+                    if p_name in self.result.params:
+                        peak_params[p_name].value = self.result.params[p_name].value
+                
+                fitted_height = peak_model.eval(peak_params, x=np.array([center_val]))[0]
+            else:
+                fitted_height = None
+
+            peak.set_result(self.result.params, fitted_height)
+            # 移除 calculate_area 调用，因为它计算的是 gross area (包含背景)
+            # 我们现在只使用 set_result 中设置的 amplitude (net area)
+            # peak.calculate_area(self.x_data, self.y_fit)
         
         return self.result
     
