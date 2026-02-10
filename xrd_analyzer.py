@@ -338,9 +338,6 @@ class Fitter:
                 idx = np.argmin(np.abs(self.x_data - peak.center_guess))
                 initial_height = self.y_data[idx]
             
-            pars[f'{prefix}amplitude'].set(value=initial_height, min=0,
-                                          vary=not peak.fixed_height) # 尊重锁定设置
-            
             # FWHM约束 - 关键修改：确保vary=True，除非被锁定
             is_sigma_vary = not peak.fixed_fwhm
             
@@ -353,14 +350,44 @@ class Fitter:
             else:
                 # 薄膜峰较宽
                 initial_sigma = 0.15
-                
+            
+            # 设置Sigma参数
             if peak.peak_type == 'substrate':
                  pars[f'{prefix}sigma'].set(value=initial_sigma, min=0.01, max=1.0, vary=is_sigma_vary)
             else:
                  pars[f'{prefix}sigma'].set(value=initial_sigma, min=0.01, max=1.5, vary=is_sigma_vary)
-            
+
             # Pseudo-Voigt混合参数
             pars[f'{prefix}fraction'].set(value=0.5, min=0, max=1, vary=True)
+            
+            # 设置Amplitude (Area) 参数
+            # 如果锁定高度，我们需要约束Amplitude，使其随Sigma和Eta变化以保持Height恒定
+            if peak.fixed_height:
+                # Formula (LMFIT Pseudo-Voigt):
+                # H = (A / sigma) * [ (1-eta)*sqrt(ln(2)/pi) + eta/pi ]
+                # Therefore: A = H * sigma / [ (1-eta)*sqrt(ln(2)/pi) + eta/pi ]
+                # Constants: sqrt(ln(2)/pi) ≈ 0.4697186, 1/pi ≈ 0.3183099
+                
+                # Use the target height (initial_height) as the fixed value
+                h_val = initial_height
+                if h_val <= 0: h_val = 1e-6 # Avoid zero
+                
+                expr = f'{h_val:.6f} * {prefix}sigma / ((1-{prefix}fraction)*0.4697186 + {prefix}fraction*0.3183099)'
+                
+                # Set initial value for amplitude based on current sigma/fraction to start cleanly
+                term1 = (1 - 0.5) * 0.4697186
+                term2 = 0.5 * 0.3183099
+                initial_amp = h_val * initial_sigma / (term1 + term2)
+                
+                pars[f'{prefix}amplitude'].set(value=initial_amp, min=0, expr=expr)
+            else:
+                # Normal estimation: Area approx Height * Sigma * 2.5 (rough guess)
+                # Better: calculate based on assumed fraction=0.5
+                term1 = (1 - 0.5) * 0.4697186
+                term2 = 0.5 * 0.3183099
+                initial_amp = initial_height * initial_sigma / (term1 + term2)
+                
+                pars[f'{prefix}amplitude'].set(value=initial_amp, min=0, vary=True)
             
             self.params.update(pars)
         
@@ -370,9 +397,11 @@ class Fitter:
             if len(film_peaks) >= 2:
                 reference_peak = film_peaks[0]
                 for peak in film_peaks[1:]:
-                    self.params[f'p{peak.peak_id}_sigma'].set(
-                        expr=f'p{reference_peak.peak_id}_sigma'
-                    )
+                    # 如果该峰单独被锁定FWHM，则跳过全局约束
+                    if not peak.fixed_fwhm:
+                        self.params[f'p{peak.peak_id}_sigma'].set(
+                            expr=f'p{reference_peak.peak_id}_sigma'
+                        )
         
         # 添加峰间距约束
         if min_peak_separation > 0 and len(self.peaks) >= 2:
@@ -755,6 +784,14 @@ class Reporter:
         ax2.set_yscale('log')
         ax2.set_ylabel('Intensity (Log)', fontsize=12, fontweight='bold')
         ax2.grid(True, alpha=0.3)
+        
+        # 强制设置Log图的Y轴范围（基于原始数据）
+        y_pos = self.fitter.y_data[self.fitter.y_data > 0]
+        if len(y_pos) > 0:
+            y_min = np.min(y_pos)
+            y_max = np.max(self.fitter.y_data)
+            ax2.set_ylim(y_min * 0.5, y_max * 2.0)
+
         # 对数图不重复显示图例
 
         # --- 3. 残差图 (Residuals) ---

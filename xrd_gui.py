@@ -1242,6 +1242,16 @@ class XRDAnalyzerGUI(QMainWindow):
         # 强制设置X轴范围为当前数据范围
         if self.fitter.x_data is not None:
             ax.set_xlim(self.fitter.x_data.min(), self.fitter.x_data.max())
+
+        # 强制设置Y轴范围（基于原始数据，避免拟合曲线的拖尾影响Log显示）
+        if self.plot_canvas.yscale == 'log' and self.fitter.y_data is not None:
+            # 过滤出大于0的数据点
+            y_pos = self.fitter.y_data[self.fitter.y_data > 0]
+            if len(y_pos) > 0:
+                y_min = np.min(y_pos)
+                y_max = np.max(self.fitter.y_data)
+                # 设置Y轴范围: 下限为最小正值的0.5倍，上限为最大值的2倍
+                ax.set_ylim(y_min * 0.5, y_max * 2.0)
             
         ax.legend(loc='best', fontsize=9, framealpha=0.9)
         ax.grid(True, alpha=0.3, linestyle='--')
