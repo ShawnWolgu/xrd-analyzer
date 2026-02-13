@@ -194,12 +194,13 @@ class FittingThread(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
     
-    def __init__(self, fitter, constrain_fwhm, min_separation, log_weight=0.5):
+    def __init__(self, fitter, constrain_fwhm, min_separation, log_weight=0.5, fixed_background=None):
         super().__init__()
         self.fitter = fitter
         self.constrain_fwhm = constrain_fwhm
         self.min_separation = min_separation
         self.log_weight = log_weight
+        self.fixed_background = fixed_background
         
     def run(self):
         try:
@@ -208,7 +209,8 @@ class FittingThread(QThread):
             # 构建模型
             self.fitter.build_model(
                 constrain_fwhm=self.constrain_fwhm,
-                min_peak_separation=self.min_separation
+                min_peak_separation=self.min_separation,
+                fixed_background=self.fixed_background
             )
             
             self.progress.emit(40)
@@ -470,6 +472,24 @@ class XRDAnalyzerGUI(QMainWindow):
         weight_layout.addWidget(self.log_slider)
         weight_layout.addWidget(self.log_spin)
         fit_layout.addLayout(weight_layout)
+        
+        # 背景强度设置
+        bg_setting_layout = QHBoxLayout()
+        bg_setting_layout.addWidget(QLabel("背景强度:"))
+        
+        self.bg_spin = QDoubleSpinBox()
+        self.bg_spin.setRange(0, 1000000)
+        self.bg_spin.setDecimals(2)
+        self.bg_spin.setValue(0.0)
+        self.bg_spin.setSingleStep(1.0)
+        self.bg_spin.setToolTip("设置固定的背景强度值或显示拟合后的背景值")
+        
+        self.bg_fix_cb = QCheckBox("固定")
+        self.bg_fix_cb.setToolTip("勾选此项将强制使用设定的背景值，不进行拟合")
+        
+        bg_setting_layout.addWidget(self.bg_spin)
+        bg_setting_layout.addWidget(self.bg_fix_cb)
+        fit_layout.addLayout(bg_setting_layout)
         
         # 执行拟合按钮
         execute_fit_btn = QPushButton("执行拟合")
@@ -1154,11 +1174,14 @@ class XRDAnalyzerGUI(QMainWindow):
         # 创建拟合线程
         log_weight = self.log_spin.value() / 100.0
         
+        fixed_bg = self.bg_spin.value() if self.bg_fix_cb.isChecked() else None
+        
         self.fit_thread = FittingThread(
             self.fitter,
             self.constrain_fwhm_cb.isChecked(),
             self.min_separation.value(),
-            log_weight=log_weight
+            log_weight=log_weight,
+            fixed_background=fixed_bg
         )
         
         self.fit_thread.progress.connect(self.progress_bar.setValue)
@@ -1171,6 +1194,12 @@ class XRDAnalyzerGUI(QMainWindow):
     def on_fitting_finished(self, result):
         """拟合完成处理"""
         self.progress_bar.setVisible(False)
+        
+        # 更新背景显示 (如果未固定)
+        if not self.bg_fix_cb.isChecked() and self.fitter.result is not None:
+            if 'c' in self.fitter.result.params:
+                bg_val = self.fitter.result.params['c'].value
+                self.bg_spin.setValue(bg_val)
         
         # 创建Reporter
         self.reporter = Reporter(

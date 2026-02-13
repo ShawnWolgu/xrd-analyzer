@@ -34,14 +34,25 @@ The project uses **script-based verification** rather than a formal test runner 
     ```
 
 2.  **Run a "Single Test" (Component Verification)**:
-    Since there are no individual test units, verify specific components by creating a temporary script or using a one-liner.
-    *Example: Testing the Peak Area calculation*
-    ```bash
-    python -c "from xrd_analyzer import Peak; p=Peak(44.0, 1000, 0.5, 'Test'); print(f'Area: {p.area}')"
+    Since there are no individual test units, verify specific components by creating a temporary script.
+    *Example: Testing the Background Fixing feature*
+    ```python
+    # Create a temporary file 'repro_bg.py'
+    import numpy as np
+    from xrd_analyzer import Fitter
+    
+    x = np.linspace(20, 30, 100)
+    y = 50.0 + 100 * np.exp(-(x - 25)**2 / 0.5)
+    fitter = Fitter(x, y)
+    fitter.add_peak(25.0, (24.0, 26.0))
+    # Test fixed background
+    fitter.build_model(fixed_background=50.0)
+    result = fitter.execute_fitting()
+    print(f"Fitted BG: {result.params['c'].value}")
     ```
-    *Example: Testing Plotting independently*
+    Then run:
     ```bash
-    python plot_test.py
+    python repro_bg.py && rm repro_bg.py
     ```
 
 3.  **Verify GUI Startup**:
@@ -105,6 +116,7 @@ def fit_spectrum(self, x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
 ### Core Logic (`xrd_analyzer.py`)
 - **Vectorization**: Use `numpy` array operations. Avoid explicit loops over data points.
 - **Model**: Use `lmfit.models.PseudoVoigtModel` for peak fitting.
+- **Background**: Supports both fitted background (variable `c`) and fixed background (constant `c`).
 - **Data Class**: `Peak` class encapsulates single peak parameters (center, height, fwhm).
 - **Calculation Rules**:
   - **Height**: `model.eval(x=center)` (Intensity at peak center).
@@ -114,6 +126,8 @@ def fit_spectrum(self, x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
 - **Pattern**: Signal-Slot mechanism.
 - **Threading**: Heavy computations (fitting) **MUST** run in a `QThread` to keep the UI responsive.
 - **State**: The GUI should track the current `Fitter` instance and `file_path`.
+- **New Features**: 
+  - **Background Control**: Use `bg_spin` and `bg_fix_cb` to control background intensity.
 
 ## 6. Rules for Agents (Cursor/Copilot)
 

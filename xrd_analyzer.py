@@ -312,10 +312,18 @@ class Fitter:
         return peak_positions.tolist()
     
     def build_model(self, constrain_fwhm: bool = False,
-                   min_peak_separation: float = 0.2):
+                   min_peak_separation: float = 0.2,
+                   fixed_background: Optional[float] = None):
         """构建lmfit模型"""
         self.model = lmfit.models.ConstantModel()
         self.params = self.model.make_params()
+        
+        # 约束背景
+        if 'c' in self.params:
+            if fixed_background is not None:
+                self.params['c'].set(value=fixed_background, vary=False)
+            else:
+                self.params['c'].set(min=0, vary=True)
         
         for peak in self.peaks:
             prefix = f'p{peak.peak_id}_'
