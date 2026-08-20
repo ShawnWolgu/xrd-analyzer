@@ -1,0 +1,4 @@
+interface:
+  display_name: "XRD Scientific Maintenance"
+  short_description: "Guard XRD refactors with scientific validation"
+  default_prompt: "Use $xrd-scientific-maintenance to refactor this XRD code without weakening numerical or scientific validity."
