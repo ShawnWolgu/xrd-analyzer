@@ -598,6 +598,9 @@ class XRDAnalyzerGUI(QMainWindow):
         self.peak_table.setColumnWidth(4, 100) # FWHM
         self.peak_table.setColumnWidth(5, 80) # Type
         
+        # Connect itemChanged signal for live editing
+        self.peak_table.itemChanged.connect(self.on_peak_table_changed)
+        
         peak_layout.addWidget(self.peak_table)
         
         # 删除峰按钮
@@ -948,6 +951,7 @@ class XRDAnalyzerGUI(QMainWindow):
         if self.fitter is None:
             return
         
+        self.peak_table.blockSignals(True)
         self.peak_table.setRowCount(len(self.fitter.peaks))
         
         for i, peak in enumerate(self.fitter.peaks):
@@ -960,7 +964,7 @@ class XRDAnalyzerGUI(QMainWindow):
             # 2. 位置 (Pos) - 总是显示猜测值或结果值
             center_val = peak.center if peak.center is not None else peak.center_guess
             item_pos = QTableWidgetItem(f"{center_val:.3f}")
-            item_pos.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_pos.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_pos.setCheckState(Qt.Checked if peak.fixed_center else Qt.Unchecked)
             self.peak_table.setItem(i, 2, item_pos)
             
@@ -970,7 +974,7 @@ class XRDAnalyzerGUI(QMainWindow):
             else:
                 val_str = "NaN"
             item_h = QTableWidgetItem(val_str)
-            item_h.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_h.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_h.setCheckState(Qt.Checked if peak.fixed_height else Qt.Unchecked)
             self.peak_table.setItem(i, 3, item_h)
             
@@ -980,12 +984,68 @@ class XRDAnalyzerGUI(QMainWindow):
             else:
                 val_str = "NaN"
             item_w = QTableWidgetItem(val_str)
-            item_w.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item_w.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_w.setCheckState(Qt.Checked if peak.fixed_fwhm else Qt.Unchecked)
             self.peak_table.setItem(i, 4, item_w)
             
             # 5. 类型
             self.peak_table.setItem(i, 5, QTableWidgetItem(peak.peak_type))
+            
+        self.peak_table.blockSignals(False)
+
+    def on_peak_table_changed(self, item):
+        """表格单元格修改事件"""
+        if self.fitter is None:
+            return
+            
+        row = item.row()
+        col = item.column()
+        
+        # Get peak ID from first column
+        peak_id_item = self.peak_table.item(row, 0)
+        if not peak_id_item: return
+        peak_id = int(peak_id_item.text())
+        
+        peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
+        if not peak: return
+        
+        # Sync CheckState first (locking)
+        if col == 2:
+            peak.fixed_center = (item.checkState() == Qt.Checked)
+        elif col == 3:
+            peak.fixed_height = (item.checkState() == Qt.Checked)
+        elif col == 4:
+            peak.fixed_fwhm = (item.checkState() == Qt.Checked)
+            
+        # Parse value for editing
+        try:
+            text = item.text().strip()
+            if text == "NaN" or not text: return
+            val = float(text)
+            
+            if col == 2: # Center
+                peak.center_guess = val
+                # Update bounds
+                if peak.bounds:
+                    width = peak.bounds[1] - peak.bounds[0]
+                    peak.bounds = (val - width/2, val + width/2)
+                # Update center result too, so it persists
+                peak.center = val
+                
+            elif col == 3: # Height
+                peak.height_guess = val
+                peak.height = val
+                
+            elif col == 4: # FWHM
+                # Convert FWHM to sigma (approximate for guess)
+                # Pseudo-Voigt FWHM ≈ 2.3548 * sigma (if Gaussian)
+                # or 2 * sigma (if Lorentzian)
+                # We use factor 2.2 as a middle ground for guess
+                peak.sigma_guess = val / 2.2
+                peak.fwhm = val
+                
+        except ValueError:
+            pass # Ignore invalid input
     
     def quick_add_peak(self):
         """快速添加峰"""
@@ -1143,18 +1203,19 @@ class XRDAnalyzerGUI(QMainWindow):
 
     def refine_fitting(self):
         """基于当前结果优化拟合"""
-        if self.fitter is None or self.fitter.result is None:
-            QMessageBox.warning(self, "警告", "请先执行一次常规拟合")
+        if self.fitter is None:
+            QMessageBox.warning(self, "警告", "请先添加峰")
             return
             
-        # 1. 同步锁定状态
+        # 1. 同步锁定状态 (fallback)
         self.sync_table_to_peaks()
         
-        # 2. 更新猜测值
-        self.fitter.update_guesses_from_result()
+        # Note: We do NOT call update_guesses_from_result() here anymore.
+        # The Peak objects are already updated automatically after the last fit,
+        # or manually by the user via the table.
+        # Calling update_guesses_from_result() would revert manual edits to the old result values.
         
-        # 3. 重新执行拟合
-        # 注意：这里我们不需要清除result，execute_fitting会创建新的model
+        # 2. 重新执行拟合
         self.statusBar().showMessage('正在优化拟合...')
         self.execute_fitting()
 

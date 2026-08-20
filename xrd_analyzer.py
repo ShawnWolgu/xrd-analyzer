@@ -518,6 +518,20 @@ class Fitter:
                 fitted_height = None
 
             peak.set_result(self.result.params, fitted_height)
+            
+            # --- Auto-update guesses for next run (or GUI editing) ---
+            # Update guesses to the fitted values
+            peak.center_guess = peak.center
+            peak.height_guess = peak.height
+            # Convert FWHM back to Sigma for guess, or use fitted sigma
+            peak.sigma_guess = self.result.params[f'{prefix}sigma'].value
+            
+            # Update bounds to center on the new position, keeping width constant
+            if peak.bounds:
+                width = peak.bounds[1] - peak.bounds[0]
+                peak.bounds = (peak.center - width/2, peak.center + width/2)
+            # ---------------------------------------------------------
+
             # 移除 calculate_area 调用，因为它计算的是 gross area (包含背景)
             # 我们现在只使用 set_result 中设置的 amplitude (net area)
             # peak.calculate_area(self.x_data, self.y_fit)
