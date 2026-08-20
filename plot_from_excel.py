@@ -179,11 +179,13 @@ class XRDPlotterFromExcel:
         ax1.legend(loc='best', fontsize=9, framealpha=0.9, ncol=2)
         ax1.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
-        # 添加拟合质量文本
-        r2 = self.metrics['R_squared'].values[0]
-        chi2 = self.metrics['Reduced_Chi_squared'].values[0]
-        
-        text = f'R² = {r2:.6f}\nχ²ᵣ = {chi2:.4f}'
+        # 新项目只显示拟合掩码内的R²；旧工作簿保留原标签以免误称。
+        if 'R_squared_fit' in self.metrics.columns:
+            r2 = self.metrics['R_squared_fit'].values[0]
+            text = f'R²_fit = {r2:.6f}'
+        else:
+            r2 = self.metrics['R_squared'].values[0]
+            text = f'R² (legacy) = {r2:.6f}'
         
         ax1.text(0.02, 0.98, text, 
                 transform=ax1.transAxes, 
@@ -197,17 +199,6 @@ class XRDPlotterFromExcel:
             
             ax2.axhline(y=0, color='gray', linestyle='--', linewidth=1, zorder=1)
             ax2.scatter(x_data, residuals, s=8, alpha=0.6, color='blue', zorder=2)
-            
-            # 添加残差的统计信息
-            rmse = np.sqrt(np.mean(residuals**2))
-            max_res = np.max(np.abs(residuals))
-            
-            ax2.text(0.98, 0.95, f'RMSE={rmse:.2f}\nMax={max_res:.2f}',
-                    transform=ax2.transAxes,
-                    verticalalignment='top',
-                    horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7),
-                    fontsize=9)
             
             ax2.set_xlabel('2θ (degree)', fontsize=13, fontweight='bold')
             ax2.set_ylabel('Residuals', fontsize=11, fontweight='bold')

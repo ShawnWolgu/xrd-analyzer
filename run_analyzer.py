@@ -28,7 +28,8 @@ required_packages = {
     'matplotlib': 'matplotlib',
     'pandas': 'pandas',
     'lmfit': 'lmfit',
-    'openpyxl': 'openpyxl'
+    'openpyxl': 'openpyxl',
+    'threadpoolctl': 'threadpoolctl',
 }
 
 missing_packages = []
