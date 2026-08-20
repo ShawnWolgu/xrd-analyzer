@@ -1416,32 +1416,21 @@ class XRDAnalyzerGUI(QMainWindow):
         text += "物理参数计算\n"
         text += "=" * 60 + "\n\n"
         
-        # 计算晶格参数
-        lattice_params = self.reporter.calculate_lattice_parameters()
+        characteristic_lengths = self.reporter.calculate_characteristic_lengths()
         
-        text += "【晶格参数】(λ = 1.5406 Å, Cu Kα)\n"
+        text += "【反射峰特征长度 d】(λ = 1.5406 Å, Cu Kα)\n"
         text += "-" * 40 + "\n"
-        
-        for key, value in lattice_params.items():
-            if key == 'Tetragonality':
-                text += f"\n{key}:\n"
-                text += f"  c轴晶格常数: {value['c_axis']:.6f} Å\n"
-                text += f"  a轴晶格常数: {value['a_axis']:.6f} Å\n"
-                text += f"  四方度 (c/a): {value['c/a_ratio']:.6f}\n"
-                
-                # 判断相结构
-                if value['c/a_ratio'] > 1.01:
-                    text += f"  → 四方相占主导 (Tetragonal)\n"
-                elif value['c/a_ratio'] < 0.99:
-                    text += f"  → 可能存在压应变\n"
-                else:
-                    text += f"  → 接近立方相或应变释放\n"
-            else:
-                text += f"\n{key}:\n"
-                if isinstance(value, dict):
-                    for k, v in value.items():
-                        if isinstance(v, (int, float)):
-                            text += f"  {k:20s}: {v:.6f}\n"
+        text += "说明：该值是对应反射峰的Bragg d间距，不等同于晶格常数。\n"
+        text += "程序不根据002、004、111、200等峰名自动推断晶格倍数。\n"
+
+        for value in characteristic_lengths.values():
+            reflection_label = value['reflection_label'] or '未指定'
+            text += f"\nPeak {value['peak_id']} ({reflection_label}):\n"
+            text += f"  峰位 2θ             : {value['2theta_deg']:.6f}°\n"
+            text += (
+                "  特征长度 d           : "
+                f"{value['characteristic_length_angstrom']:.6f} Å\n"
+            )
         
         # 晶粒尺寸估算 (Scherrer公式)
         text += "\n【晶粒尺寸估算】(Scherrer公式)\n"
@@ -1466,8 +1455,8 @@ class XRDAnalyzerGUI(QMainWindow):
         # 应力/应变分析
         text += "\n【应力分析提示】\n"
         text += "-" * 40 + "\n"
-        text += "• 如果002和200峰分裂明显 → 存在四方相畸变\n"
-        text += "• 峰位偏移 → 存在晶格应变\n"
+        text += "• 特征长度只表示当前反射的d间距，不直接代表晶格常数\n"
+        text += "• 晶相或应变判断需要明确的(hkl)指认和独立参考峰位\n"
         text += "• 峰展宽 → 晶粒尺寸减小或微观应变增大\n"
         text += "• 建议结合sin²ψ方法进行残余应力定量分析\n"
         
@@ -1553,4 +1542,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -18,7 +18,7 @@ The migrated workbook and images are `REGRESSION-ONLY`; they are not ground trut
 | Pseudo-Voigt FWHM | `Peak.set_result` uses `2.3548 * sigma`; lmfit defines `fwhm = 2 * sigma` | Peak width and every downstream broadening estimate | Strict xfail; correct in a separate scientific change |
 | Manual FWHM edit | GUI converts entered FWHM using an intermediate factor `2.2` | Refit starts from a parameter with different semantics | Document and test during GUI-state extraction |
 | Pseudo-Voigt fallback height | Fallback formula uses a Gaussian coefficient different from lmfit's normalized model | Height can differ when direct model evaluation is unavailable | Add an independent formula test before correction |
-| Legacy lattice terminology | The code labels Bragg `d` values as `a/c`, infers two reflections by angular order, and reports tetragonality | The same logic cannot safely cover 002/004/111/200/222/400 or unknown reflections | Replace with per-peak `characteristic length d`; do not infer lattice constants or multipliers |
+| Legacy lattice terminology | The legacy code labeled Bragg `d` values as `a/c`, inferred two reflections by angular order, and reported tetragonality | The same logic cannot safely cover 002/004/111/200/222/400 or unknown reflections | Resolved and analytically verified for direct Bragg `d`: report per-peak `characteristic length d`; do not infer lattice constants or multipliers |
 | Scan gaps | Stitching fills uncovered grid points with `1e-5` without a mask | Artificial observations can enter preprocessing and fitting | Strict xfail; preserve gaps or validity masks |
 | Minimum separation | The second peak's lower bound is based on the first peak's initial guess, not its fitted center | Fitted peaks can violate the requested pairwise separation | Strict xfail; implement a relational constraint |
 | Mixed objective metrics | A log residual and normalized linear residual are concatenated, then generic chi-square/AIC/BIC values are reported | Statistical labels may not have their conventional meaning | Define objective-specific diagnostics before changing output |
@@ -37,8 +37,13 @@ The current tests establish only that:
 - polynomial background subtraction recovers an exact synthetic polynomial;
 - the constructed lmfit model itself exposes `fwhm = 2 * sigma`;
 - the tracked sample scan remains readable and structurally unchanged;
-- known partial-row, FWHM, characteristic-length terminology, scan-gap, and separation problems
-  remain visible as strict xfails.
+- the Bragg calculation returns the injected per-reflection characteristic length without
+  applying a multiplier from labels such as 004 or 111;
+- new workbooks use the characteristic-length column while the plotting reader still recognizes
+  historical `d_spacing_Å` columns and per-peak values in legacy `Lattice_Parameters` sheets;
+- the GUI displays the reflection label and characteristic length without `a/c` or tetragonality
+  claims;
+- known partial-row, FWHM, scan-gap, and separation problems remain visible as strict xfails.
 
 They do not validate the complete fitting workflow against instrument standards, certified PZT
 reference data, or an independent peak-fitting implementation.

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from plot_from_excel import XRDPlotterFromExcel
 from xrd_analyzer import Fitter, Peak, Reporter
 
 
@@ -79,13 +80,6 @@ def _two_theta_from_d_spacing(d_spacing: float, wavelength: float = 1.5406) -> f
 
 
 @pytest.mark.scientific
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known legacy issue: Reporter exposes lattice/tetragonality terminology instead of "
-        "per-peak Bragg characteristic lengths."
-    ),
-)
 def test_reporter_returns_characteristic_length_without_lattice_inference() -> None:
     d_004 = 1.025
     d_111 = 2.300
@@ -114,13 +108,6 @@ def test_reporter_returns_characteristic_length_without_lattice_inference() -> N
 
 
 @pytest.mark.scientific
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known legacy issue: Excel labels Bragg d as d_spacing and can export inferred "
-        "structure analysis instead of the characteristic-length contract."
-    ),
-)
 def test_export_labels_bragg_d_as_characteristic_length(tmp_path) -> None:
     d_expected = 2.05
     fitter = Fitter(np.array([40.0, 41.0]), np.array([10.0, 12.0]))
@@ -139,8 +126,62 @@ def test_export_labels_bragg_d_as_characteristic_length(tmp_path) -> None:
 
     Reporter(fitter).export_results(output)
     peak_table = pd.read_excel(output, sheet_name="Peak_Parameters")
+    sheet_names = pd.ExcelFile(output).sheet_names
 
     assert "Characteristic_Length_d_Angstrom" in peak_table.columns
     assert "d_spacing_Å" not in peak_table.columns
     assert peak_table.loc[0, "Characteristic_Length_d_Angstrom"] == pytest.approx(d_expected)
     assert all("lattice" not in column.lower() for column in peak_table.columns)
+    assert "Structure_Analysis" not in sheet_names
+    assert "Lattice_Parameters" not in sheet_names
+
+
+def test_excel_plotter_accepts_new_and_historical_characteristic_length_columns() -> None:
+    assert (
+        XRDPlotterFromExcel._characteristic_length_column(
+            ["Peak_ID", "Characteristic_Length_d_Angstrom"]
+        )
+        == "Characteristic_Length_d_Angstrom"
+    )
+    assert (
+        XRDPlotterFromExcel._characteristic_length_column(["Peak_ID", "d_spacing_Å"])
+        == "d_spacing_Å"
+    )
+    assert XRDPlotterFromExcel._characteristic_length_column(["Peak_ID", "FWHM"]) is None
+
+
+def test_excel_plotter_extracts_only_peak_lengths_from_legacy_sheet(tmp_path) -> None:
+    workbook = tmp_path / "legacy-results.xlsx"
+    with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+        pd.DataFrame({"2theta": [40.0], "Fitted_Intensity": [1.0]}).to_excel(
+            writer,
+            sheet_name="Full_Data",
+            index=False,
+        )
+        pd.DataFrame(
+            {
+                "Peak_ID": [0],
+                "Type": ["film"],
+                "Center_2theta": [44.0],
+                "FWHM": [0.2],
+                "Height": [100.0],
+                "Area": [20.0],
+            }
+        ).to_excel(writer, sheet_name="Peak_Parameters", index=False)
+        pd.DataFrame({"R_squared": [0.99]}).to_excel(
+            writer,
+            sheet_name="Fit_Metrics",
+            index=False,
+        )
+        pd.DataFrame(
+            {
+                "Peak_0_d_spacing": [2.05],
+                "Tetragonality_c/a_ratio": [1.03],
+            }
+        ).to_excel(writer, sheet_name="Lattice_Parameters", index=False)
+
+    plotter = XRDPlotterFromExcel(workbook)
+    plotter.load_data()
+
+    assert plotter.peaks.loc[0, "Characteristic_Length_d_Angstrom"] == pytest.approx(2.05)
+    assert all("Tetragonality" not in column for column in plotter.peaks.columns)

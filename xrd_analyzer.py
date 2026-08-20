@@ -606,71 +606,48 @@ class Reporter:
         
         return self.metrics
     
-    def calculate_lattice_parameters(self, wavelength: float = 1.5406) -> Dict:
-        """计算晶格常数 (λ=1.5406 Å for Cu Kα)"""
-        lattice_params = {}
-        
+    def calculate_characteristic_lengths(self, wavelength: float = 1.5406) -> Dict:
+        """按Bragg定律计算各反射峰对应的特征长度d。"""
+        characteristic_lengths = {}
+
         for peak in self.fitter.peaks:
             if peak.center is None:
                 continue
-            
+
             # Bragg's Law: λ = 2d*sinθ
             theta_rad = np.radians(peak.center / 2)
-            d_spacing = wavelength / (2 * np.sin(theta_rad))
-            
-            lattice_params[f'Peak_{peak.peak_id}'] = {
-                '2theta': peak.center,
-                'd_spacing': d_spacing,
-                'FWHM': peak.fwhm,
-                'Area': peak.area,
-                'Height': peak.height
+            characteristic_length = wavelength / (2 * np.sin(theta_rad))
+
+            characteristic_lengths[f'Peak_{peak.peak_id}'] = {
+                'peak_id': peak.peak_id,
+                'reflection_label': peak.name,
+                '2theta_deg': peak.center,
+                'characteristic_length_angstrom': characteristic_length,
+                'wavelength_angstrom': wavelength,
             }
-        
-        # 计算Tetragonality (假设002和200峰)
-        film_peaks = [p for p in self.fitter.peaks if p.peak_type == 'film']
-        if len(film_peaks) >= 2:
-            # 按角度排序
-            sorted_peaks = sorted(film_peaks, key=lambda p: p.center)
-            
-            theta1 = np.radians(sorted_peaks[0].center / 2)
-            theta2 = np.radians(sorted_peaks[1].center / 2)
-            
-            d1 = wavelength / (2 * np.sin(theta1))
-            d2 = wavelength / (2 * np.sin(theta2))
-            
-            # 假设较小角度是c轴，较大角度是a轴
-            c_axis = d1
-            a_axis = d2
-            tetragonality = c_axis / a_axis
-            
-            lattice_params['Tetragonality'] = {
-                'c_axis': c_axis,
-                'a_axis': a_axis,
-                'c/a_ratio': tetragonality
-            }
-        
-        return lattice_params
+
+        return characteristic_lengths
     
     def export_results(self, output_path: str):
         """导出结果到Excel（包含原始数据和处理后数据）"""
-        # 计算晶格参数以便获取d-spacing和四方度
-        lattice_params = self.calculate_lattice_parameters()
+        characteristic_lengths = self.calculate_characteristic_lengths()
         
         results_list = []
         
         for peak in self.fitter.peaks:
-            # 从lattice_params中获取d_spacing
-            d_spacing = None
+            characteristic_length = None
             peak_key = f'Peak_{peak.peak_id}'
-            if peak_key in lattice_params:
-                d_spacing = lattice_params[peak_key].get('d_spacing')
+            if peak_key in characteristic_lengths:
+                characteristic_length = characteristic_lengths[peak_key].get(
+                    'characteristic_length_angstrom'
+                )
 
             results_list.append({
                 'Peak_ID': peak.peak_id,
                 'Name': peak.name,          # 新增: 峰名称
                 'Type': peak.peak_type,
                 'Center_2theta': peak.center,
-                'd_spacing_Å': d_spacing,   # 新增: d间距
+                'Characteristic_Length_d_Angstrom': characteristic_length,
                 'FWHM': peak.fwhm,
                 'Height': peak.height,
                 'Area': peak.area,
@@ -681,17 +658,6 @@ class Reporter:
         
         # 评估指标
         metrics_df = pd.DataFrame([self.metrics])
-        
-        # 结构分析参数 (如 Tetragonality) - 单独放入一张表，避免压扁在一行
-        structure_list = []
-        if 'Tetragonality' in lattice_params:
-            tet = lattice_params['Tetragonality']
-            structure_list.append({
-                'Parameter': 'Tetragonality',
-                'c_axis': tet.get('c_axis'),
-                'a_axis': tet.get('a_axis'),
-                'c/a_ratio': tet.get('c/a_ratio')
-            })
         
         # 完整数据表
         data_dict = {
@@ -728,11 +694,6 @@ class Reporter:
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             df_peaks.to_excel(writer, sheet_name='Peak_Parameters', index=False)
             metrics_df.to_excel(writer, sheet_name='Fit_Metrics', index=False)
-            
-            # 结构分析参数
-            if structure_list:
-                df_structure = pd.DataFrame(structure_list)
-                df_structure.to_excel(writer, sheet_name='Structure_Analysis', index=False)
             
             # 完整数据
             df_data.to_excel(writer, sheet_name='Full_Data', index=False)
@@ -857,4 +818,3 @@ def pseudo_voigt(x, amplitude, center, sigma, fraction):
     gaussian = np.exp(-((x - center) / sigma)**2 / 2)
     lorentzian = 1 / (1 + ((x - center) / sigma)**2)
     return amplitude * (fraction * gaussian + (1 - fraction) * lorentzian)
-

@@ -47,8 +47,7 @@ def example_full_analysis(file_path):
     print("\n[4/5] 执行峰拟合...")
     fitter = Fitter(x_data, y_data)
     
-    # 手动添加峰（002和200峰）
-    # 这里假设您已经知道大致位置
+    # 手动添加两个示例反射峰；实际名称和位置应由使用者给出
     fitter.add_peak(
         center_guess=44.3,
         bounds=(44.0, 44.6),
@@ -93,14 +92,15 @@ def example_full_analysis(file_path):
         print(f"    FWHM: {peak.fwhm:.4f}°")
         print(f"    面积: {peak.area:.2f}")
     
-    # 计算物理参数
-    lattice_params = reporter.calculate_lattice_parameters()
-    if 'Tetragonality' in lattice_params:
-        tet = lattice_params['Tetragonality']
-        print(f"\n晶格参数:")
-        print(f"  c轴: {tet['c_axis']:.6f} Å")
-        print(f"  a轴: {tet['a_axis']:.6f} Å")
-        print(f"  c/a: {tet['c/a_ratio']:.6f}")
+    # 计算各反射峰的特征长度（Bragg d间距）
+    characteristic_lengths = reporter.calculate_characteristic_lengths()
+    print("\n反射峰特征长度:")
+    for value in characteristic_lengths.values():
+        label = value['reflection_label'] or '未指定'
+        print(
+            f"  Peak {value['peak_id']} ({label}): "
+            f"d = {value['characteristic_length_angstrom']:.6f} Å"
+        )
     
     # 6. 保存结果
     output_dir = Path(file_path).parent
@@ -183,4 +183,3 @@ if __name__ == '__main__':
     # example_auto_peak_finding(file_path)
     
     print("请取消注释上面的代码行并指定您的数据文件路径")
-

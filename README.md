@@ -9,6 +9,10 @@ legacy numerical output must not yet be treated as independently validated scien
 truth. See [Scientific validation](docs/scientific-validation.md) before using derived values in
 a publication or formal report.
 
+The program reports the direct Bragg `d` spacing as a reflection-specific characteristic
+length. Peak labels such as 002, 004, 111, 200, 222, or 400 do not trigger lattice-constant
+multipliers or tetragonality inference.
+
 ## Current capabilities
 
 - Load two-column text scans and combine multiple scan ranges.
