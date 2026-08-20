@@ -357,10 +357,12 @@ class DataLoader:
                 parts = line.strip().split()
                 if len(parts) == 2:
                     try:
-                        x_data.append(float(parts[0]))
-                        y_data.append(float(parts[1]))
+                        two_theta = float(parts[0])
+                        intensity = float(parts[1])
                     except ValueError:
                         continue
+                    x_data.append(two_theta)
+                    y_data.append(intensity)
         
         return np.array(x_data), np.array(y_data)
     
@@ -379,7 +381,7 @@ class DataLoader:
         策略:
         1. 确定整体的X范围
         2. 生成均匀网格
-        3. 将每个数据集插值到网格上，未覆盖区域设为基线值(1e-5)
+        3. 将每个数据集插值到网格上，未覆盖区域保留为NaN
         4. 重叠区域取平均
         """
         if not datasets:
@@ -430,7 +432,7 @@ class DataLoader:
         # 4. 计算最终结果
         # 有数据的地方取平均
         mask_data = weights > 0
-        y_final = np.ones_like(x_uniform) * 1e-5  # 默认填充基线值
+        y_final = np.full_like(x_uniform, np.nan, dtype=float)
         
         y_final[mask_data] = y_accum[mask_data] / weights[mask_data]
         
@@ -439,6 +441,26 @@ class DataLoader:
 
 class Preprocessor:
     """数据预处理类"""
+
+    @staticmethod
+    def _finite_segments(y_data: np.ndarray) -> List[slice]:
+        """返回连续有限强度区间，避免滤波跨越未测量的扫描空隙。"""
+        finite_indices = np.flatnonzero(np.isfinite(y_data))
+        if finite_indices.size == 0:
+            return []
+
+        split_points = np.flatnonzero(np.diff(finite_indices) > 1) + 1
+        index_groups = np.split(finite_indices, split_points)
+        return [slice(group[0], group[-1] + 1) for group in index_groups]
+
+    @classmethod
+    def _filter_finite_segments(cls, y_data: np.ndarray, operation) -> np.ndarray:
+        """仅对连续有效数据段执行滤波，并原样保留缺失区间。"""
+        values = np.asarray(y_data, dtype=float)
+        result = np.full_like(values, np.nan, dtype=float)
+        for segment in cls._finite_segments(values):
+            result[segment] = operation(values[segment])
+        return result
     
     @staticmethod
     def apply_savgol_filter(y_data: np.ndarray, 
@@ -447,22 +469,39 @@ class Preprocessor:
         """Savitzky-Golay滤波"""
         if window_length % 2 == 0:
             window_length += 1
-        return savgol_filter(y_data, window_length, polyorder)
+
+        def filter_segment(segment: np.ndarray) -> np.ndarray:
+            if segment.size <= polyorder:
+                return segment.copy()
+            local_window = min(window_length, segment.size)
+            if local_window % 2 == 0:
+                local_window -= 1
+            if local_window <= polyorder:
+                return segment.copy()
+            return savgol_filter(segment, local_window, polyorder)
+
+        return Preprocessor._filter_finite_segments(y_data, filter_segment)
     
     @staticmethod
     def apply_gaussian_filter(y_data: np.ndarray, 
                              sigma: float = 1.0) -> np.ndarray:
         """高斯滤波"""
-        return ndimage.gaussian_filter1d(y_data, sigma)
+        return Preprocessor._filter_finite_segments(
+            y_data,
+            lambda segment: ndimage.gaussian_filter1d(segment, sigma),
+        )
     
     @staticmethod
     def apply_fft_filter(y_data: np.ndarray, 
                         cutoff_freq: float = 0.1) -> np.ndarray:
         """FFT低通滤波"""
-        fft_vals = fft.fft(y_data)
-        freq = fft.fftfreq(len(y_data))
-        fft_vals[np.abs(freq) > cutoff_freq] = 0
-        return np.real(fft.ifft(fft_vals))
+        def filter_segment(segment: np.ndarray) -> np.ndarray:
+            fft_vals = fft.fft(segment)
+            freq = fft.fftfreq(len(segment))
+            fft_vals[np.abs(freq) > cutoff_freq] = 0
+            return np.real(fft.ifft(fft_vals))
+
+        return Preprocessor._filter_finite_segments(y_data, filter_segment)
     
     @staticmethod
     def subtract_background_polynomial(x_data: np.ndarray, 
@@ -470,33 +509,48 @@ class Preprocessor:
                                       degree: int = 2,
                                       anchor_points: List[Tuple[float, float]] = None) -> np.ndarray:
         """多项式背景扣除"""
+        x_values = np.asarray(x_data, dtype=float)
+        y_values = np.asarray(y_data, dtype=float)
+        valid_data = np.isfinite(x_values) & np.isfinite(y_values)
         if anchor_points:
             # 使用锚点进行多项式拟合
             x_anchors = np.array([p[0] for p in anchor_points])
             y_anchors = np.array([p[1] for p in anchor_points])
+            valid_anchors = np.isfinite(x_anchors) & np.isfinite(y_anchors)
+            x_anchors = x_anchors[valid_anchors]
+            y_anchors = y_anchors[valid_anchors]
+            if x_anchors.size <= degree:
+                raise ValueError("有效背景锚点数量不足以完成多项式拟合")
             coeffs = np.polyfit(x_anchors, y_anchors, degree)
         else:
             # 使用全部数据拟合
-            coeffs = np.polyfit(x_data, y_data, degree)
+            if np.count_nonzero(valid_data) <= degree:
+                raise ValueError("有效数据点数量不足以完成多项式背景拟合")
+            coeffs = np.polyfit(x_values[valid_data], y_values[valid_data], degree)
         
-        background = np.polyval(coeffs, x_data)
-        return y_data - background, background
+        background = np.full_like(y_values, np.nan, dtype=float)
+        background[valid_data] = np.polyval(coeffs, x_values[valid_data])
+        return y_values - background, background
     
     @staticmethod
     def subtract_background_snip(y_data: np.ndarray, 
                                 iterations: int = 40) -> Tuple[np.ndarray, np.ndarray]:
         """SNIP (Statistics-sensitive Non-linear Iterative Peak-clipping) 算法"""
-        data = y_data.copy()
-        background = np.zeros_like(data)
-        
-        for i in range(iterations):
-            window = 2**i
-            for j in range(window, len(data) - window):
-                data[j] = min(data[j], 
-                             (data[j - window] + data[j + window]) / 2)
-        
-        background = data
-        return y_data - background, background
+        values = np.asarray(y_data, dtype=float)
+
+        def snip_segment(segment: np.ndarray) -> np.ndarray:
+            data = segment.copy()
+            for i in range(iterations):
+                window = 2**i
+                for j in range(window, len(data) - window):
+                    data[j] = min(
+                        data[j],
+                        (data[j - window] + data[j + window]) / 2,
+                    )
+            return data
+
+        background = Preprocessor._filter_finite_segments(values, snip_segment)
+        return values - background, background
 
 
 class Fitter:
@@ -571,8 +625,9 @@ class Fitter:
         x_data: np.ndarray,
         include_ranges: Optional[List[Tuple[float, float]]] = None,
         exclude_ranges: Optional[List[Tuple[float, float]]] = None,
+        y_data: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """从人工包含/排除区间构建拟合点掩码，不修改原始数组。"""
+        """从人工区间和有效观测构建拟合点掩码。"""
         if include_ranges:
             mask = np.zeros_like(x_data, dtype=bool)
             for lower, upper in include_ranges:
@@ -584,6 +639,13 @@ class Fitter:
         for lower, upper in exclude_ranges or []:
             lo, hi = sorted((lower, upper))
             mask &= ~((x_data >= lo) & (x_data <= hi))
+
+        mask &= np.isfinite(x_data)
+        if y_data is not None:
+            y_values = np.asarray(y_data)
+            if y_values.shape != np.asarray(x_data).shape:
+                raise ValueError("拟合数据的2θ与强度长度不一致")
+            mask &= np.isfinite(y_values)
 
         if not np.any(mask):
             raise ValueError("人工拟合区间没有包含任何数据点")
@@ -825,7 +887,8 @@ class Fitter:
                             expr=f'p{reference_peak.peak_id}_sigma'
                         )
         
-        # 添加峰间距约束
+        # 添加峰间距约束。使用独立的gap参数表达两个
+        # 中心之间的关系，避免把后一个峰绑定到前一个峰的初始猜测。
         if min_peak_separation > 0 and len(self.peaks) >= 2:
             sorted_peaks = sorted(
                 (p for p in self.peaks if p.fit_state == 'optimize'),
@@ -834,10 +897,56 @@ class Fitter:
             for i in range(len(sorted_peaks) - 1):
                 p1 = sorted_peaks[i]
                 p2 = sorted_peaks[i + 1]
-                # 确保p2的中心至少比p1大min_peak_separation
-                current_min = p2.bounds[0]
-                new_min = max(current_min, p1.center_guess + min_peak_separation)
-                self.params[f'p{p2.peak_id}_center'].set(min=new_min)
+                center1 = self.params[f'p{p1.peak_id}_center']
+                center2 = self.params[f'p{p2.peak_id}_center']
+
+                if p1.fixed_center and p2.fixed_center:
+                    if center2.value - center1.value < min_peak_separation:
+                        raise ValueError(
+                            f"固定的Peak {p1.peak_id}与Peak {p2.peak_id}"
+                            "不满足最小峰间距"
+                        )
+                    continue
+
+                if p1.fixed_center:
+                    new_minimum = max(center2.min, center1.value + min_peak_separation)
+                    if new_minimum > center2.max:
+                        raise ValueError(
+                            f"Peak {p2.peak_id}的中心边界无法满足最小峰间距"
+                        )
+                    center2.set(min=new_minimum)
+                    continue
+
+                if p2.fixed_center:
+                    new_maximum = min(center1.max, center2.value - min_peak_separation)
+                    if new_maximum < center1.min:
+                        raise ValueError(
+                            f"Peak {p1.peak_id}的中心边界无法满足最小峰间距"
+                        )
+                    center1.set(max=new_maximum)
+                    continue
+
+                gap_name = f'p{p2.peak_id}_center_gap'
+                initial_gap = max(
+                    p2.center_guess - p1.center_guess,
+                    min_peak_separation,
+                )
+                maximum_gap = p2.bounds[1] - p1.bounds[0]
+                if maximum_gap < min_peak_separation:
+                    raise ValueError(
+                        f"Peak {p1.peak_id}与Peak {p2.peak_id}的中心边界"
+                        "无法满足最小峰间距"
+                    )
+                self.params.add(
+                    gap_name,
+                    value=min(initial_gap, maximum_gap),
+                    min=min_peak_separation,
+                    max=maximum_gap,
+                    vary=True,
+                )
+                center2.set(
+                    expr=f'p{p1.peak_id}_center + {gap_name}'
+                )
         
     def execute_fitting(
         self,
@@ -876,6 +985,7 @@ class Fitter:
             self.x_data,
             include_ranges=include_ranges,
             exclude_ranges=exclude_ranges,
+            y_data=self.y_data,
         )
         x_fit = self.x_data[self.fit_mask]
         y_fit_observed = self.y_data[self.fit_mask]
@@ -1239,7 +1349,7 @@ class Reporter:
             # 插值原始数据到拟合数据的x点
             from scipy.interpolate import interp1d
             f_interp = interp1d(self.x_original, self.y_original, 
-                               kind='linear', bounds_error=False, fill_value=0)
+                               kind='linear', bounds_error=False, fill_value=np.nan)
             y_original_interp = f_interp(self.fitter.x_data)
             data_dict['Original_Intensity'] = y_original_interp
         

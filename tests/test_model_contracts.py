@@ -214,6 +214,15 @@ def test_fit_mask_combines_manual_include_and_exclude_ranges() -> None:
     assert x_data[mask].tolist() == [2.0, 3.0, 6.0, 7.0, 8.0]
 
 
+def test_fit_mask_excludes_missing_observations() -> None:
+    x_data = np.array([42.0, 43.0, 44.0, 45.0])
+    y_data = np.array([10.0, np.nan, 30.0, 40.0])
+
+    mask = Fitter.build_fit_mask(x_data, y_data=y_data)
+
+    assert mask.tolist() == [True, False, True, True]
+
+
 def test_candidate_fit_does_not_replace_guesses_until_explicit_acceptance() -> None:
     x_data = np.linspace(43.0, 45.0, 201)
     source_model = lmfit.models.PseudoVoigtModel(prefix="source_")
@@ -325,13 +334,6 @@ def test_peak_result_uses_lmfit_pseudo_voigt_fwhm_definition() -> None:
 
 
 @pytest.mark.scientific
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known legacy issue: the minimum separation is a static bound derived from the first "
-        "peak guess, not a relation between fitted centers."
-    ),
-)
 def test_minimum_peak_separation_tracks_the_fitted_first_center() -> None:
     fitter = Fitter(np.linspace(43.0, 47.0, 201), np.ones(201))
     fitter.add_peak(44.0, (43.0, 46.0))
@@ -339,10 +341,39 @@ def test_minimum_peak_separation_tracks_the_fitted_first_center() -> None:
     fitter.build_model(min_peak_separation=0.3)
 
     fitter.params["p0_center"].set(value=45.0)
-    fitter.params["p1_center"].set(value=44.5)
     fitter.params.update_constraints()
 
+    assert fitter.params["p1_center"].expr == "p0_center + p1_center_gap"
     assert fitter.params["p1_center"].value >= fitter.params["p0_center"].value + 0.3
+
+
+@pytest.mark.scientific
+def test_minimum_peak_separation_keeps_each_center_inside_its_own_bounds() -> None:
+    fitter = Fitter(np.linspace(43.0, 45.0, 201), np.ones(201))
+    fitter.add_peak(43.8, (43.0, 44.2))
+    fitter.add_peak(44.3, (44.0, 44.6))
+
+    fitter.build_model(min_peak_separation=0.3)
+    fitter.params["p0_center"].set(value=44.2)
+    fitter.params["p1_center_gap"].set(value=1.6)
+    fitter.params.update_constraints()
+
+    assert fitter.params["p1_center"].value <= 44.6
+
+
+@pytest.mark.scientific
+def test_minimum_peak_separation_does_not_override_a_fixed_center() -> None:
+    fitter = Fitter(np.linspace(43.0, 45.0, 201), np.ones(201))
+    fitter.add_peak(43.8, (43.0, 44.2))
+    fixed_peak = fitter.add_peak(44.3, (44.0, 44.6))
+    fixed_peak.fixed_center = True
+
+    fitter.build_model(min_peak_separation=0.3)
+
+    assert fitter.params["p1_center"].expr is None
+    assert fitter.params["p1_center"].vary is False
+    assert fitter.params["p1_center"].value == pytest.approx(44.3)
+    assert fitter.params["p0_center"].max <= 44.0 + 1e-12
 
 
 def _two_theta_from_d_spacing(d_spacing: float, wavelength: float = 1.5406) -> float:
@@ -481,6 +512,25 @@ def test_excel_project_round_trip_preserves_data_peak_state_and_gui_state(tmp_pa
     assert restored_peak["Fixed_Center"] is True
     assert restored_peak["Fixed_FWHM"] is True
     assert restored_peak["Fit_State"] == "frozen"
+
+
+def test_export_marks_uncovered_original_data_as_missing(tmp_path) -> None:
+    fitter = Fitter(
+        np.array([42.0, 43.0, 44.0]),
+        np.array([10.0, 20.0, 30.0]),
+    )
+    fitter.y_fit = fitter.y_data.copy()
+    output = tmp_path / "missing-original.xlsx"
+
+    Reporter(
+        fitter,
+        x_original=np.array([43.0, 44.0]),
+        y_original=np.array([20.0, 30.0]),
+    ).export_results(output)
+
+    full_data = pd.read_excel(output, sheet_name="Full_Data")
+    assert np.isnan(full_data.loc[0, "Original_Intensity"])
+    assert full_data.loc[1:, "Original_Intensity"].tolist() == pytest.approx([20.0, 30.0])
 
 
 def test_excel_plotter_accepts_new_and_historical_characteristic_length_columns() -> None:

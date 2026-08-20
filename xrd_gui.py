@@ -1099,6 +1099,7 @@ class XRDAnalyzerGUI(QMainWindow):
                     self.x_data,
                     include_ranges,
                     exclude_ranges,
+                    y_data=self.y_data,
                 )
             except ValueError:
                 self.fitter.fit_mask = np.ones_like(self.x_data, dtype=bool)

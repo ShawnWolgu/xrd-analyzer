@@ -106,8 +106,9 @@ python -m pytest
 python -m ruff check .
 ```
 
-The suite includes strict expected-failure tests for confirmed legacy scientific issues. An
-`XFAIL` records an unresolved problem; it is not a successful scientific validation.
+The suite contains regression tests for corrected legacy scientific issues. A passing suite
+only verifies the documented contracts; it does not turn historical example data into certified
+scientific ground truth.
 
 ## Repository map
 

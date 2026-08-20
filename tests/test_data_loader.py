@@ -18,13 +18,6 @@ def test_load_txt_reads_valid_two_column_rows(tmp_path) -> None:
     np.testing.assert_array_equal(y_data, [100.0, 120.0])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known legacy issue: load_txt appends a valid angle before converting intensity, so a "
-        "partly numeric row can leave x and y with different lengths."
-    ),
-)
 def test_load_txt_skips_headers_and_partly_numeric_rows_atomically(tmp_path) -> None:
     source = tmp_path / "scan.txt"
     source.write_text(
@@ -67,13 +60,6 @@ def test_stitch_datasets_averages_a_simple_overlap() -> None:
 
 
 @pytest.mark.scientific
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known legacy issue: uncovered scan gaps are silently filled with 1e-5 instead of "
-        "retaining a missing-data mask; see docs/scientific-validation.md."
-    ),
-)
 def test_stitch_datasets_preserves_uncovered_gaps() -> None:
     first = (np.array([0.0, 1.0]), np.array([10.0, 11.0]))
     second = (np.array([4.0, 5.0]), np.array([14.0, 15.0]))
