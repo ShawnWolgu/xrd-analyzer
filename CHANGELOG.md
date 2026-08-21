@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Adopted the GNU General Public License v3.0 only (`GPL-3.0-only`).
+- Added source-install and launch instructions for Windows, macOS, and Linux.
+- Aligned the Python package metadata version with the v1.1.0 application release.
+
 ## v1.1.0 — 2026-08-21
 
 - Added live Chinese, Japanese, and English UI switching from the upper-right language selector.

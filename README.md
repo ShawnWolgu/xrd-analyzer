@@ -56,19 +56,67 @@ multipliers or tetragonality inference.
 - Display reflection-specific Bragg characteristic lengths and provisional Scherrer-related
   quantities in the GUI.
 
-## Install
+## Quick start
 
-Use Python 3.10 or newer in an isolated environment:
+XRD Analyzer currently runs from source. It does not require a separately built installer,
+but it does require Python 3.10 or newer and an internet connection while installing its
+Python dependencies.
+
+First download the repository with Git:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
+git clone https://github.com/ShawnWolgu/xrd-analyzer.git
+cd xrd-analyzer
 ```
 
-The historical `requirements.txt` remains available for runtime-only installation. Project
-metadata and development dependencies are defined in `pyproject.toml`.
+Alternatively, use **Code → Download ZIP** on GitHub, extract the archive, and open a terminal
+in the extracted `xrd-analyzer` directory.
+
+### Windows
+
+Install Python from [python.org](https://www.python.org/downloads/windows/) and enable
+**Add Python to PATH** during installation. Then run these commands in PowerShell:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe main.py
+```
+
+For later launches, only the last command is required.
+
+### macOS and Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python main.py
+```
+
+For later launches:
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+The first dependency installation may take several minutes because PyQt5, NumPy, SciPy,
+Matplotlib, pandas, lmfit, and the Excel support libraries are installed into the isolated
+environment. The historical `requirements.txt` remains available for runtime-only
+installation; `pyproject.toml` is the maintained dependency definition.
+
+### Development installation
+
+Contributors can also install the test and lint tools:
+
+```bash
+python -m pip install -e '.[dev]'
+python -m pytest
+python -m ruff check .
+```
 
 ## Run
 
@@ -174,5 +222,12 @@ overwrite an input scan during analysis.
 
 ## License
 
-A distribution license has not yet been selected. Until one is added, no open-source license is
-granted by this repository.
+Copyright (C) 2026 ShawnWolgu.
+
+XRD Analyzer is free and open-source software licensed under the
+[GNU General Public License version 3 only](LICENSE) (`GPL-3.0-only`). You may use, study,
+modify, and redistribute it under the terms of that license. Distributed modified versions
+must preserve the applicable GPL notices and make the corresponding source code available.
+
+The GPLv3 license is also consistent with this application's use of the GPL edition of PyQt5.
+This summary is informational; the complete terms in `LICENSE` control.

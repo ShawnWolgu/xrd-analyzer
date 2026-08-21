@@ -1,13 +1,20 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "xrd-analyzer"
-version = "1.0.0"
+version = "1.1.0"
 description = "General-purpose desktop XRD analysis, peak fitting, and reporting tool"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Operating System :: OS Independent",
+]
 dependencies = [
   "PyQt5>=5.15.0",
   "numpy>=1.20.0",
