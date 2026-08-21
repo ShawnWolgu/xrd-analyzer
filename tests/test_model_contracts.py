@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from plot_from_excel import XRDPlotterFromExcel
+from xrd_analyzer.tools.plot_from_excel import XRDPlotterFromExcel
 from xrd_analyzer import (
     DEFAULT_WAVELENGTH_ANGSTROM,
     BraggGeometry,

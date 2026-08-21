@@ -1,4 +1,4 @@
-# example_usage.py - 使用示例
+# XRD Analyzer 使用示例
 
 """
 XRD分析系统使用示例

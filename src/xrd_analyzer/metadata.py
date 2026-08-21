@@ -1,4 +1,4 @@
-"""User-facing product identity shared by all application entry points."""
+"""User-facing product identity shared by XRD Analyzer entry points."""
 
 APP_NAME = "XRD Analyzer"
 APP_VERSION = "1.1.0"

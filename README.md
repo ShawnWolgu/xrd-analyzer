@@ -24,7 +24,8 @@ multipliers or tetragonality inference.
 - Recompute preprocessing from an immutable raw scan and an explicit ordered operation list;
   applying the same controls twice no longer compounds filtering.
 - Enforce a one-way frontend/backend dependency boundary: the PyQt frontend imports XRD
-  behavior only through `xrd_backend.py`, while the backend dependency closure contains no PyQt.
+  behavior only through `xrd_analyzer.backend`, while the backend dependency closure contains
+  no PyQt.
 - Add peaks manually by numerical input or by clicking the plotted scan.
 - Add a numerical peak either from its `2theta` position or by converting a theoretical
   interplanar spacing `d` with the first-order Bragg relation.
@@ -124,8 +125,8 @@ python -m ruff check .
 python main.py
 ```
 
-After editable installation, the `xrd-analyzer` command is also available.
-The historical `python run_analyzer.py` command remains as a compatibility wrapper.
+After editable installation, the `xrd-analyzer` command and `python -m xrd_analyzer` are also
+available.
 
 The fitting workflow is intentionally user-controlled:
 
@@ -190,35 +191,37 @@ scientific ground truth.
 
 ## Repository map
 
-- `xrd_analyzer.py`: compatibility facade plus the remaining fitting and reporting engine.
-- `main.py`: the single application entry point and GUI startup orchestration.
-- `xrd_gui.py`: legacy PyQt5 interface and application state.
-- `xrd_backend.py`: the only public backend entrypoint used by the frontend, including
-  `XRDApplicationService`.
-- `xrd_session.py`: immutable scans, source scans, preprocessing provenance, and fit configuration.
-- `xrd_io.py`: two-column scan loading, cropping, and multi-scan stitching.
-- `xrd_preprocessing.py`: pure filtering and background transformations.
-- `xrd_peaks.py`: peak guesses, locks, states, and fitted parameter semantics.
-- `xrd_crystallography.py`: Bragg characteristic-length and apparent Scherrer calculations.
-- `xrd_project.py`: versioned Excel project loading and restored-result compatibility.
-- `plot_from_excel.py`: plotting and summaries from exported workbooks.
-- `ui_i18n.py`: centralized Chinese, Japanese, and English interface translations.
+- `main.py`: small source-checkout launcher.
+- `src/xrd_analyzer/`: installable application package.
+- `src/xrd_analyzer/application.py`: dependency checks and GUI startup lifecycle.
+- `src/xrd_analyzer/gui.py`: PyQt5 interface and application state.
+- `src/xrd_analyzer/backend.py`: public scientific backend boundary used by the frontend.
+- `src/xrd_analyzer/engine.py`: fitting and reporting engine.
+- `src/xrd_analyzer/session.py`: immutable scans, preprocessing provenance, and fit configuration.
+- `src/xrd_analyzer/io.py`: two-column scan loading, cropping, and multi-scan stitching.
+- `src/xrd_analyzer/preprocessing.py`: pure filtering and background transformations.
+- `src/xrd_analyzer/peaks.py`: peak guesses, locks, states, and fitted parameter semantics.
+- `src/xrd_analyzer/crystallography.py`: diffraction geometry and derived quantities.
+- `src/xrd_analyzer/project.py`: versioned Excel project loading and restoration.
+- `src/xrd_analyzer/tools/`: optional workbook plotting and text-conversion tools.
+- `src/xrd_analyzer/i18n.py`: Chinese, Japanese, and English UI translations.
+- `examples/`: source API usage examples.
 - `tests/`: automated regression and scientific-contract tests.
-- `tests/baselines/`: versioned synthetic-reference and historical-regression specifications.
+- `tests/baselines/`: versioned synthetic-reference specifications.
 - `docs/architecture.md`: current boundaries and incremental target structure.
 - `docs/fitting-model.md`: scientific fitting pipeline, equations, variables, and interpretation.
 - `docs/scientific-validation.md`: evidence status and scientific correction backlog.
 - `.agents/skills/xrd-scientific-maintenance/`: repository-specific Codex workflow.
 
-The package extraction is incremental. Existing imports remain compatible while state and
-scientific operations move out of GUI callbacks. Workbook schema version 3 records ordered
+The package uses a standard `src/` layout. The top-level `xrd_analyzer` API remains compatible
+while state and scientific operations move out of GUI callbacks. Workbook schema version 3 records ordered
 preprocessing steps, structured fit configuration, scan hashes, and retained-point counts.
 
 ## Data and generated artifacts
 
-The tracked scan, workbook, and figures are historical examples from the migrated project.
-They may be used as regression artifacts, but they are not certified reference data. Never
-overwrite an input scan during analysis.
+Experimental scans and generated fitting workbooks or figures are not part of the source
+distribution. Keep them in a separate analysis directory; common local export names are ignored
+by Git. Never overwrite an input scan during analysis.
 
 ## License
 

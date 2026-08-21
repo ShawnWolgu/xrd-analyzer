@@ -1,27 +1,27 @@
-# plot_from_excel.py - 从Excel文件重新绘制拟合图
+# 从 Excel 项目重新绘制拟合图
 
 """
 从XRD分析结果Excel文件重新生成高质量拟合图
 
 使用方法:
-    python plot_from_excel.py results.xlsx
+    xrd-plot-results results.xlsx
 # 基本用法
-python plot_from_excel.py results.xlsx
+xrd-plot-results results.xlsx
 
 # 指定输出文件
-python plot_from_excel.py results.xlsx -o my_plot.png
+xrd-plot-results results.xlsx -o my_plot.png
 
 # 生成所有图表
-python plot_from_excel.py results.xlsx --all
+xrd-plot-results results.xlsx --all
 
 # 不显示残差和原始数据
-python plot_from_excel.py results.xlsx --no-residuals --no-original
+xrd-plot-results results.xlsx --no-residuals --no-original
 
 # 只生成对比图
-python plot_from_excel.py results.xlsx --comparison
+xrd-plot-results results.xlsx --comparison
 
 # 打印摘要报告
-python plot_from_excel.py results.xlsx --summary
+xrd-plot-results results.xlsx --summary
 
 或者在脚本中直接指定文件路径
 """
@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional
 
-from plot_style import apply_plot_style
+from ..plotting import apply_plot_style
 
 
 apply_plot_style()
@@ -387,16 +387,16 @@ def main():
         epilog="""
 示例:
   # 基本用法
-  python plot_from_excel.py results.xlsx
+  xrd-plot-results results.xlsx
   
   # 指定输出文件名
-  python plot_from_excel.py results.xlsx -o output.png
+  xrd-plot-results results.xlsx -o output.png
   
   # 生成所有类型的图
-  python plot_from_excel.py results.xlsx --all
+  xrd-plot-results results.xlsx --all
   
   # 不显示原始数据和残差
-  python plot_from_excel.py results.xlsx --no-original --no-residuals
+  xrd-plot-results results.xlsx --no-original --no-residuals
         """
     )
     

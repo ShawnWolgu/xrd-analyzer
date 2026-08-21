@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from xrd_session import AnalysisSession, FitConfiguration, PreprocessingStep, ScanData
+from xrd_analyzer.session import AnalysisSession, FitConfiguration, PreprocessingStep, ScanData
 
 
 def test_scan_data_owns_read_only_array_copies() -> None:

@@ -11,3 +11,11 @@ dist/
 *.egg-info/
 .venv/
 venv/
+
+# Local analysis exports and user-maintained peak libraries
+*_results.xlsx
+*_fitting.png
+database/*_peaks.txt
+
+# Historical migration artifacts are not repository fixtures
+/230610*

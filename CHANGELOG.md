@@ -5,6 +5,9 @@
 - Adopted the GNU General Public License v3.0 only (`GPL-3.0-only`).
 - Added source-install and launch instructions for Windows, macOS, and Linux.
 - Aligned the Python package metadata version with the v1.1.0 application release.
+- Moved application modules into a standard `src/xrd_analyzer/` package while keeping
+  `main.py` as the repository launcher.
+- Removed migrated `230610` scan/export artifacts and ignored common local fitting outputs.
 
 ## v1.1.0 — 2026-08-21
 

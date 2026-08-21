@@ -2,23 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from xrd_backend import (
+from xrd_analyzer.backend import (
     BraggGeometry,
-    DataLoader,
     Fitter,
     Reporter,
-    ScanData,
 )
 
 
-REPOSITORY_ROOT = Path(__file__).parents[1]
 BASELINE_DIRECTORY = Path(__file__).parent / "baselines"
 
 
@@ -120,42 +116,3 @@ def test_synthetic_reference_recovers_known_peak_parameters() -> None:
             expected["characteristic_length_angstrom"],
             abs=tolerances["characteristic_length_absolute_angstrom"],
         )
-
-
-@pytest.mark.baseline
-def test_historical_scan_and_preprocessing_match_versioned_regression_baseline() -> None:
-    baseline = _load_baseline("historical_scan_v1.json")
-    source_path = REPOSITORY_ROOT / baseline["source_file"]
-    file_digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    x_data, y_data = DataLoader.load_txt(source_path)
-    scan = ScanData(x_data, y_data, source_id=str(source_path))
-    preprocess = baseline["preprocessing"]
-    from xrd_backend import Preprocessor
-
-    filtered = Preprocessor.apply_savgol_filter(
-        y_data,
-        window_length=preprocess["window_length"],
-        polyorder=preprocess["polyorder"],
-    )
-    tolerance = baseline["numeric_tolerances"]
-    approx = {
-        "rel": tolerance["relative"],
-        "abs": tolerance["absolute"],
-    }
-
-    assert file_digest == baseline["file_sha256"]
-    assert scan.content_sha256 == baseline["scan_content_sha256"]
-    assert len(x_data) == baseline["points"]
-    assert x_data[0] == pytest.approx(baseline["x_first"], **approx)
-    assert x_data[-1] == pytest.approx(baseline["x_last"], **approx)
-    assert np.median(np.diff(x_data)) == pytest.approx(
-        baseline["x_step_median"], **approx
-    )
-    assert np.min(y_data) == pytest.approx(baseline["intensity_min"], **approx)
-    assert np.max(y_data) == pytest.approx(baseline["intensity_max"], **approx)
-    assert np.sum(y_data) == pytest.approx(baseline["intensity_sum"], **approx)
-    assert np.sum(filtered) == pytest.approx(preprocess["intensity_sum"], **approx)
-    assert np.max(filtered) == pytest.approx(preprocess["intensity_max"], **approx)
-    assert x_data[np.argmax(filtered)] == pytest.approx(
-        preprocess["argmax_two_theta"], **approx
-    )

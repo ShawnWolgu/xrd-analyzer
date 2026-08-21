@@ -31,10 +31,10 @@ from xrd_analyzer import (
     PROJECT_WORKBOOK_SCHEMA_VERSION,
     Reporter,
 )
-from xrd_gui import FittingThread, PeakConfigDialog, XRDAnalyzerGUI
-from xrd_session import AnalysisSession, PreprocessingStep, ScanData
+from xrd_analyzer.gui import FittingThread, PeakConfigDialog, XRDAnalyzerGUI
+from xrd_analyzer.session import AnalysisSession, PreprocessingStep, ScanData
 from main import startup_banner_text
-from ui_i18n import translate
+from xrd_analyzer.i18n import translate
 
 
 def test_product_identity_is_general_xrd_analysis() -> None:
@@ -206,7 +206,7 @@ def test_theoretical_d_mode_rejects_peak_outside_loaded_range(monkeypatch) -> No
     window.set_ui_language("en")
     warnings = []
     monkeypatch.setattr(
-        "xrd_gui.QMessageBox.warning",
+        "xrd_analyzer.gui.QMessageBox.warning",
         lambda *args: warnings.append(args),
     )
 
@@ -349,7 +349,9 @@ def test_export_fitted_peak_positions_uses_project_database_directory(
         dialog_defaults.append(Path(default_path))
         return str(selected_path), "Text Files (*.txt)"
 
-    monkeypatch.setattr("xrd_gui.QFileDialog.getSaveFileName", choose_path)
+    monkeypatch.setattr(
+        "xrd_analyzer.gui.QFileDialog.getSaveFileName", choose_path
+    )
 
     window.export_fitted_peaks_to_file()
 
@@ -362,7 +364,7 @@ def test_export_fitted_peak_positions_uses_project_database_directory(
 
     window.fitter.clear_peaks()
     monkeypatch.setattr(
-        "xrd_gui.QFileDialog.getOpenFileName",
+        "xrd_analyzer.gui.QFileDialog.getOpenFileName",
         lambda *_args: (str(output_path), "Text Files (*.txt)"),
     )
     window.import_peaks_from_file()
@@ -570,7 +572,7 @@ def test_fitting_thread_limits_blas_parallelism(monkeypatch) -> None:
             self.executed = True
             return object()
 
-    monkeypatch.setattr("xrd_gui.threadpool_limits", fake_threadpool_limits)
+    monkeypatch.setattr("xrd_analyzer.gui.threadpool_limits", fake_threadpool_limits)
     fitter = StubFitter()
     thread = FittingThread(fitter, constrain_fwhm=False, min_separation=0.2)
 
@@ -626,7 +628,7 @@ def test_peak_state_combo_freezes_only_an_accepted_complete_shape(monkeypatch) -
     peak = window.fitter.peaks[0]
     warnings = []
     monkeypatch.setattr(
-        "xrd_gui.QMessageBox.warning",
+        "xrd_analyzer.gui.QMessageBox.warning",
         lambda *args: warnings.append(args),
     )
 
@@ -704,7 +706,7 @@ def test_fwhm_edit_outside_peak_type_bounds_is_rejected(monkeypatch) -> None:
     peak = window.fitter.peaks[0]
     warnings = []
     monkeypatch.setattr(
-        "xrd_gui.QMessageBox.warning",
+        "xrd_analyzer.gui.QMessageBox.warning",
         lambda *args: warnings.append(args),
     )
 
@@ -741,7 +743,7 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     window.wavelength_spin.setValue(2.0)
     window.peak_shift_step.setValue(0.2)
     monkeypatch.setattr(
-        "xrd_gui.QMessageBox.question",
+        "xrd_analyzer.gui.QMessageBox.question",
         lambda *args: QMessageBox.Yes,
     )
 
@@ -1047,7 +1049,7 @@ def test_delete_peak_is_blocked_while_fitting(monkeypatch) -> None:
     window.fit_thread = RunningFitThread()
     window.peak_table.selectRow(0)
     monkeypatch.setattr(
-        "xrd_gui.QMessageBox.warning",
+        "xrd_analyzer.gui.QMessageBox.warning",
         lambda *args: warnings.append(args),
     )
 

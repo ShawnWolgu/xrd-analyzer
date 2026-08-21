@@ -1,4 +1,4 @@
-# convert_csv_to_txt.py - CSV转TXT格式转换器
+# CSV转TXT格式转换器
 
 """
 将CSV格式的XRD数据转换为标准TXT格式
@@ -129,4 +129,3 @@ if __name__ == '__main__':
             batch_convert(input_path)
         else:
             convert_csv_to_txt(input_path)
-

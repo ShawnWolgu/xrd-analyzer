@@ -33,33 +33,21 @@ dev = [
 ]
 
 [project.scripts]
-xrd-analyzer = "main:main"
-xrd-plot-results = "plot_from_excel:main"
+xrd-analyzer = "xrd_analyzer.application:main"
+xrd-plot-results = "xrd_analyzer.tools.plot_from_excel:main"
 
 [project.urls]
 Repository = "https://github.com/ShawnWolgu/xrd-analyzer"
 
 [tool.setuptools]
-py-modules = [
-  "app_metadata",
-  "convert_csv_to_txt",
-  "main",
-  "plot_style",
-  "plot_from_excel",
-  "ui_i18n",
-  "xrd_backend",
-  "xrd_crystallography",
-  "xrd_analyzer",
-  "xrd_gui",
-  "xrd_io",
-  "xrd_peaks",
-  "xrd_preprocessing",
-  "xrd_project",
-  "xrd_session",
-]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
+pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "baseline: versioned core baseline and historical regression checks",

@@ -1,101 +1,56 @@
 # Architecture
 
-## Current state
-
-The application now has an explicit frontend/backend boundary:
+## Current package layout
 
 ```text
-Application entry point
-  main.py (dependency check, QApplication lifecycle, main window startup)
-      |
-      v
-Frontend
-  xrd_gui.py (PyQt widgets, user interaction, rendering, background thread)
-      |
-      | only permitted XRD dependency
-      v
-Backend public API
-  xrd_backend.py / XRDApplicationService
-      |
-      +-> xrd_session.py
-      +-> xrd_io.py
-      +-> xrd_preprocessing.py
-      +-> xrd_peaks.py
-      +-> xrd_crystallography.py
-      +-> xrd_project.py
-      +-> xrd_analyzer.py (remaining Fitter and Reporter compatibility module)
-```
-
-An automated architecture test parses imports and enforces both rules:
-
-- `main.py` is the single application entry point and `xrd_gui.py` contains no `main()`;
-- the frontend may import XRD behavior only from `xrd_backend`;
-- the complete backend dependency closure may not import PyQt.
-
-`XRDApplicationService` owns the active `AnalysisSession` and performs source loading, merging,
-cropping, preprocessing transitions, fit-configuration transitions, and Fitter construction.
-The frontend owns widgets, dialogs, tables, plots, and thread lifecycle.
-
-Raw, processed, and source scans are immutable `ScanData` values. `AnalysisSession` owns their
-relationship, the ordered preprocessing provenance, the permanent data range, and a validated
-`FitConfiguration`. Transitional GUI array attributes remain synchronized views so old callers
-continue to work. `xrd_analyzer.py` still combines fitting and reporting and is the next major
-extraction boundary.
-
-The versioned core baseline and its update policy are documented in
-[`baseline-testing.md`](baseline-testing.md).
-
-## Target boundaries
-
-Keep the target deliberately small:
-
-```text
+main.py                         source-checkout launcher
 src/xrd_analyzer/
-  io.py               raw scan loading and validated scan objects
-  preprocessing.py    pure transformations plus provenance
-  peaks.py            peak assignments and parameter semantics
-  fitting.py          model construction, constraints, objectives, fit results
-  crystallography.py  Bragg characteristic-length and broadening calculations
-  reporting.py        result schemas and export adapters
-  session.py          immutable analysis configuration and application state
-  gui/                 PyQt widgets and controllers
+  application.py               dependency checks and QApplication lifecycle
+  gui.py                       PyQt widgets, interaction, rendering, fit thread
+  backend.py                   public application-service boundary for the GUI
+  engine.py                    fitting and reporting engine
+  session.py                   immutable scan and analysis configuration
+  io.py                        scan loading, cropping, and merging
+  preprocessing.py             pure intensity transformations and provenance
+  peaks.py                     peak state and fitted-parameter semantics
+  crystallography.py           diffraction geometry and derived quantities
+  project.py                   Excel project restoration
+  i18n.py                      UI translations
+  tools/                       optional conversion and workbook plotting tools
+examples/                      API usage examples
+tests/                         scientific, regression, GUI, and architecture tests
 ```
 
-Dependency direction must remain one-way:
+The installed `xrd-analyzer` command and `python -m xrd_analyzer` route to
+`xrd_analyzer.application`. Root `main.py` remains the only application Python file at the
+repository top level and delegates to the same startup function.
+
+## Dependency boundary
 
 ```text
-GUI -> session/application -> scientific core -> NumPy/SciPy/lmfit
-                         \-> export adapters
+GUI -> backend/application service -> session and scientific core -> NumPy/SciPy/lmfit
+                                \-> project and export adapters
 ```
 
-The scientific core must not import PyQt. Export adapters must not carry alternate versions of
-scientific formulas. The GUI displays typed results and validation status from the core.
+- `gui.py` imports scientific behavior only from `.backend`.
+- The backend dependency closure must not import PyQt.
+- Scientific formulas stay in the core, not GUI callbacks.
+- Export code consumes fitted result state rather than recomputing alternate physics.
+
+These rules and the root-layout contract are enforced by
+`tests/test_architecture_boundaries.py`.
 
 ## Data and state rules
 
-- Represent a loaded scan separately from a processed scan.
-- Preserve the raw arrays, coordinate meaning, units, source identity, and masks.
-- Represent each preprocessing operation and parameter explicitly and in order.
-- Make repeated application idempotent from the same raw scan and configuration; do not filter
-  the previous filtered display accidentally.
-- Keep peak guesses and fitted results separate. Refinement may deliberately construct new
-  guesses, but it must not mutate the record of the completed fit.
+- Keep loaded raw scans separate from processed scans.
+- Preserve coordinate meaning, units, source identity, masks, and ordered preprocessing steps.
+- Recompute preprocessing from raw data so repeated application does not compound filtering.
+- Keep peak guesses separate from completed fit results.
 - Record model, objective, constraints, optimizer status, uncertainty availability, and package
-  versions with every result.
+  versions with each result.
 
-## Incremental extraction sequence
+## Remaining extraction work
 
-1. Establish tests and document legacy scientific issues without changing formulas. **Done.**
-2. Extract immutable scan/configuration/result data structures. **Scan and configuration done.**
-3. Extract loading and preprocessing as pure functions. **Done with compatibility re-exports.**
-4. Extract peak models and objectives while comparing legacy outputs. **Peak state done; fitting
-   engine remains in the compatibility module.**
-5. Extract Bragg characteristic-length calculations and correct each scientific issue in a
-   separate, validated change.
-6. Replace GUI-owned scientific state with a small controller/session object. **Data,
-   preprocessing, sources, permanent range, and fit configuration are now Session-owned; peak
-   editing and candidate results remain Fitter-owned.**
-7. Move the compatibility modules into `src/` after callers and entry points are covered.
-
-Do not perform a wholesale rewrite. Each extraction must leave the application runnable and the
-evidence status of its results explicit.
+`engine.py` still combines model construction, optimization, metrics, and reporting. Future
+structural work may separate fitting and reporting, but each extraction must preserve the
+versioned synthetic baseline and leave the application runnable.

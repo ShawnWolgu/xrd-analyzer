@@ -8,8 +8,8 @@ from typing import Iterable, Mapping, Optional, Tuple
 
 import numpy as np
 
-from xrd_io import DataLoader
-from xrd_preprocessing import Preprocessor
+from .io import DataLoader
+from .preprocessing import Preprocessor
 
 
 def _read_only_float_array(values: np.ndarray) -> np.ndarray:

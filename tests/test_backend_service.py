@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from xrd_backend import Peak, PreprocessingStep, XRDApplicationService
+from xrd_analyzer.backend import Peak, PreprocessingStep, XRDApplicationService
 
 
 def test_backend_service_owns_merge_preprocess_crop_and_fitter_creation() -> None:

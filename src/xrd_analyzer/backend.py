@@ -11,23 +11,23 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
-from xrd_analyzer import (
+from .engine import (
     Fitter,
     FitterHistory,
     PROJECT_WORKBOOK_SCHEMA_VERSION,
     Reporter,
     pseudo_voigt,
 )
-from xrd_crystallography import (
+from .crystallography import (
     BraggGeometry,
     DEFAULT_RADIATION_LABEL,
     DEFAULT_WAVELENGTH_ANGSTROM,
 )
-from xrd_io import DataLoader
-from xrd_peaks import Peak, PSEUDO_VOIGT_FWHM_FACTOR
-from xrd_preprocessing import Preprocessor
-from xrd_project import ProjectWorkbook, RestoredFitResult
-from xrd_session import (
+from .io import DataLoader
+from .peaks import Peak, PSEUDO_VOIGT_FWHM_FACTOR
+from .preprocessing import Preprocessor
+from .project import ProjectWorkbook, RestoredFitResult
+from .session import (
     AnalysisSession,
     FitConfiguration,
     PreprocessingStep,

@@ -13,17 +13,17 @@ from matplotlib.figure import Figure
 from typing import Dict, Iterable, List, Optional, Tuple
 import warnings
 
-from plot_style import apply_plot_style
+from .plotting import apply_plot_style
 
-from xrd_preprocessing import Preprocessor
-from xrd_io import DataLoader
-from xrd_crystallography import (
+from .preprocessing import Preprocessor
+from .io import DataLoader
+from .crystallography import (
     BraggGeometry,
     DEFAULT_RADIATION_LABEL,
     DEFAULT_WAVELENGTH_ANGSTROM,
 )
-from xrd_peaks import Peak, PeakSnapshot, PSEUDO_VOIGT_FWHM_FACTOR
-from xrd_project import ProjectWorkbook, RestoredFitResult
+from .peaks import Peak, PeakSnapshot, PSEUDO_VOIGT_FWHM_FACTOR
+from .project import ProjectWorkbook, RestoredFitResult
 
 
 apply_plot_style()

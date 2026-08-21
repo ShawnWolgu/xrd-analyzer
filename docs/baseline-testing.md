@@ -20,18 +20,6 @@ implementation rather than using `lmfit` to generate its own test input. The pro
 `Fitter` must recover the injected parameters and the fit-mask linear-intensity `R²_fit`.
 This validates synthetic parameter recovery, not performance on every experimental pattern.
 
-### Historical scan v1 — `REGRESSION-ONLY`
-
-`tests/baselines/historical_scan_v1.json` records the tracked example scan's:
-
-- source-file SHA-256 and numeric-content SHA-256;
-- point count, 2θ range and median step;
-- intensity extrema and sum;
-- deterministic Savitzky–Golay output statistics and peak position.
-
-This layer detects unintended input or preprocessing drift. It is not a certified material
-standard and does not prove that a fitted physical interpretation is correct.
-
 ## Required commands
 
 Run the baseline gate alone:
@@ -45,7 +33,7 @@ Run the complete release gate:
 ```bash
 python -m pytest
 python -m ruff check .
-QT_QPA_PLATFORM=offscreen MPLBACKEND=Agg python -c "import xrd_gui"
+QT_QPA_PLATFORM=offscreen MPLBACKEND=Agg python -c "import xrd_analyzer.gui"
 ```
 
 ## Change policy

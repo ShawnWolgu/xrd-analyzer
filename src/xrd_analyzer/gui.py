@@ -1,4 +1,4 @@
-# xrd_gui.py - PyQt5 GUI界面
+# XRD Analyzer PyQt5 GUI 界面
 
 import os
 import re
@@ -26,11 +26,11 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from threadpoolctl import threadpool_limits
 
-from app_metadata import APP_NAME, APP_VERSION
-from plot_style import apply_plot_style
-from ui_i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, has_translation, translate
+from .metadata import APP_NAME, APP_VERSION
+from .plotting import apply_plot_style
+from .i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, has_translation, translate
 
-from xrd_backend import (
+from .backend import (
     AnalysisSession,
     BraggGeometry, DEFAULT_RADIATION_LABEL, DEFAULT_WAVELENGTH_ANGSTROM,
     Fitter, FitterHistory, PROJECT_WORKBOOK_SCHEMA_VERSION,
@@ -2423,7 +2423,13 @@ class XRDAnalyzerGUI(QMainWindow):
     @staticmethod
     def peak_library_directory() -> Path:
         """返回项目内峰列表的默认导入与导出目录。"""
-        program_dir = Path(__file__).resolve().parent
+        module_dir = Path(__file__).resolve().parent
+        checkout_root = module_dir.parents[1]
+        program_dir = (
+            checkout_root
+            if (checkout_root / "pyproject.toml").is_file()
+            else module_dir
+        )
         database_dir = program_dir / "database"
         return database_dir if database_dir.is_dir() else program_dir
 

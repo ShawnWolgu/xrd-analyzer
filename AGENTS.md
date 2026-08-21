@@ -14,8 +14,8 @@ validated decision.
 
 Use `.agents/skills/xrd-scientific-maintenance/SKILL.md` whenever work touches:
 
-- `xrd_analyzer.py`, fitting, preprocessing, peak parameters, or derived quantities;
-- `xrd_gui.py` state that changes data or fit configuration;
+- `src/xrd_analyzer/engine.py`, fitting, preprocessing, peak parameters, or derived quantities;
+- `src/xrd_analyzer/gui.py` state that changes data or fit configuration;
 - exported numeric results, plots used for interpretation, or scientific terminology;
 - tests or documentation that claim numerical or physical correctness.
 
@@ -44,8 +44,9 @@ certified reference, or experimental standard validates it.
 - Export code must consume a result object; it must not recompute physics differently
   from the core layer.
 
-The current two-file layout is legacy. Follow `docs/architecture.md` when extracting
-modules, and preserve compatibility until callers and tests are migrated.
+The application uses a `src/xrd_analyzer/` package with a small root `main.py` launcher.
+Follow `docs/architecture.md` when extracting modules and preserve public APIs until callers
+and tests are migrated.
 
 ## Scientific guardrails
 
@@ -78,7 +79,7 @@ python -m ruff check .
 For GUI smoke testing on a headless system:
 
 ```bash
-QT_QPA_PLATFORM=offscreen MPLBACKEND=Agg python -c "import xrd_gui"
+QT_QPA_PLATFORM=offscreen MPLBACKEND=Agg python -c "import xrd_analyzer.gui"
 ```
 
 ## Code conventions
