@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
+import lmfit
 import numpy as np
+import matplotlib
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton
 import pytest
 
 from xrd_analyzer import (
@@ -18,6 +21,49 @@ from xrd_analyzer import (
 )
 from xrd_gui import FittingThread, XRDAnalyzerGUI
 from xrd_session import AnalysisSession, PreprocessingStep, ScanData
+from main import startup_banner_text
+
+
+def test_product_identity_is_general_xrd_analysis() -> None:
+    banner = startup_banner_text()
+    assert "XRD Analyzer v1.0.0" in banner
+    assert "通用 X 射线衍射分析工具" in banner
+    assert "PZT" not in banner
+    assert "薄膜专用" not in banner
+
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+    assert window.windowTitle() == "XRD Analyzer v1.0.0 - 通用 X 射线衍射分析工具"
+    assert window.peak_type_combo.currentText() == "样品峰"
+    assert window.peak_type_combo.currentData() == "film"
+    assert window.constrain_fwhm_cb.text() == "强制样品峰FWHM相等"
+    assert "PZT" not in window.peak_name_input.placeholderText()
+    window.close()
+    app.processEvents()
+
+
+def test_plot_style_uses_arial_as_primary_font() -> None:
+    assert matplotlib.rcParams["font.family"][0] == "Arial"
+
+
+def test_peak_setup_stays_left_and_management_table_is_below_plot() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+
+    assert window.peak_setup_group is window.peak_group
+    assert window.peak_table_group.isAncestorOf(window.peak_table)
+    assert not window.peak_setup_group.isAncestorOf(window.peak_table)
+    assert window.right_splitter.indexOf(window.analysis_tabs) == 0
+    assert window.right_splitter.indexOf(window.peak_table_group) == 1
+    assert window.analysis_tabs.count() == 1
+    assert window.analysis_tabs.tabText(0) == "数据与拟合"
+    assert not any(
+        button.text() == "自动寻峰"
+        for button in window.peak_setup_group.findChildren(QPushButton)
+    )
+
+    window.close()
+    app.processEvents()
 
 
 def _window_with_two_peaks() -> tuple[QApplication, XRDAnalyzerGUI]:
@@ -84,33 +130,6 @@ def test_theoretical_d_mode_rejects_peak_outside_loaded_range(monkeypatch) -> No
     app.processEvents()
 
 
-def test_physics_panel_reports_characteristic_length_without_lattice_inference() -> None:
-    app = QApplication.instance() or QApplication([])
-    fitter = Fitter(np.array([40.0, 41.0]), np.array([10.0, 12.0]))
-    peak = fitter.add_peak(44.0, peak_type="film", name="004")
-    peak.center = 44.0
-    peak.fwhm = 0.2
-    peak.height = 100.0
-    peak.area = 20.0
-    peak.eta = 0.5
-
-    window = XRDAnalyzerGUI()
-    window.fitter = fitter
-    window.reporter = Reporter(fitter)
-    window.display_physics_parameters()
-    text = window.physics_text.toPlainText()
-
-    assert "【反射峰特征长度 d】" in text
-    assert "Peak 0 (004)" in text
-    assert "程序不根据002、004、111、200等峰名自动推断晶格倍数" in text
-    assert "c轴晶格常数" not in text
-    assert "a轴晶格常数" not in text
-    assert "四方度" not in text
-
-    window.close()
-    app.processEvents()
-
-
 def test_fit_plot_callout_shows_only_fit_mask_r_squared() -> None:
     app = QApplication.instance() or QApplication([])
     fitter = Fitter(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 100.0]))
@@ -135,7 +154,7 @@ def test_fit_plot_callout_shows_only_fit_mask_r_squared() -> None:
     app.processEvents()
 
 
-def test_editing_project_wavelength_updates_displayed_derived_values() -> None:
+def test_editing_project_wavelength_updates_reporter_provenance() -> None:
     app = QApplication.instance() or QApplication([])
     fitter = Fitter(np.array([59.0, 61.0]), np.array([1.0, 1.0]))
     peak = fitter.add_peak(60.0, name="reference")
@@ -151,10 +170,7 @@ def test_editing_project_wavelength_updates_displayed_derived_values() -> None:
     window.wavelength_spin.setValue(2.0)
 
     assert window.reporter.wavelength_angstrom == pytest.approx(2.0)
-    text = window.physics_text.toPlainText()
-    assert "λ = 2.000000 Å, 自定义波长" in text
-    assert "2.000000 Å" in text
-    assert "表观Scherrer相干畴尺寸估算" in text
+    assert window.reporter.radiation_label == "自定义波长"
 
     window.close()
     app.processEvents()
@@ -187,7 +203,7 @@ def test_peak_table_displays_fitted_area_between_position_and_height() -> None:
     assert window.peak_table.item(0, 5).text() == "0.2345"
     assert headers[6:9] == ["η", "峰状态", "类型"]
     assert window.peak_table.item(0, 6).text() == "NaN"
-    assert window.peak_table.item(0, 8).text() == "film"
+    assert window.peak_table.item(0, 8).text() == "样品峰"
 
     window.peak_table.item(0, 4).setCheckState(Qt.Checked)
     window.peak_table.item(0, 5).setCheckState(Qt.Checked)
@@ -199,6 +215,208 @@ def test_peak_table_displays_fitted_area_between_position_and_height() -> None:
     window.sync_table_to_peaks()
     assert peak.fixed_height is True
     assert peak.fixed_fwhm is True
+
+    window.close()
+    app.processEvents()
+
+
+def test_non_fitting_peak_changes_do_not_create_history_snapshots() -> None:
+    app, window = _window_with_two_peaks()
+    window.fit_history.clear()
+    window.update_fit_history_buttons()
+
+    window.set_peak_fit_state(0, "disabled")
+    assert not window.fit_history.can_undo
+
+    window.peak_table.selectRow(1)
+    window.delete_selected_peak()
+
+    assert [peak.name for peak in window.fitter.peaks] == ["004"]
+    assert not window.fit_history.can_undo
+
+    window.add_peak_to_fitter(48.0, (47.5, 48.5), "film", "new")
+    assert [peak.name for peak in window.fitter.peaks] == ["004", "new"]
+    assert not window.fit_history.can_undo
+
+    window.close()
+    app.processEvents()
+
+
+def test_export_fitted_peak_positions_uses_project_database_directory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    app, window = _window_with_two_peaks()
+    window.fitter.result = SimpleNamespace(params=lmfit.Parameters())
+    window.fitter.peaks[0].center = 44.1234564
+    window.fitter.peaks[1].center = 46.6543214
+    window.fitter.peaks[1].fit_state = "disabled"
+    selected_path = tmp_path / "my-fitted-peaks"
+    dialog_defaults = []
+
+    def choose_path(_parent, _title, default_path, _filters):
+        dialog_defaults.append(Path(default_path))
+        return str(selected_path), "Text Files (*.txt)"
+
+    monkeypatch.setattr("xrd_gui.QFileDialog.getSaveFileName", choose_path)
+
+    window.export_fitted_peaks_to_file()
+
+    expected_default_dir = Path(__file__).parents[1] / "database"
+    assert dialog_defaults[0].parent == expected_default_dir
+    output_path = selected_path.with_suffix(".txt")
+    assert output_path.exists()
+    assert "44.123456 - film - 004" in output_path.read_text(encoding="utf-8")
+    assert "200" not in output_path.read_text(encoding="utf-8")
+
+    window.fitter.clear_peaks()
+    monkeypatch.setattr(
+        "xrd_gui.QFileDialog.getOpenFileName",
+        lambda *_args: (str(output_path), "Text Files (*.txt)"),
+    )
+    window.import_peaks_from_file()
+    assert len(window.fitter.peaks) == 1
+    assert window.fitter.peaks[0].center_guess == pytest.approx(44.123456)
+    assert window.fitter.peaks[0].name == "004"
+
+    window.close()
+    app.processEvents()
+
+
+def test_peak_shift_buttons_and_slider_move_all_peaks_without_fit_history() -> None:
+    app, window = _window_with_two_peaks()
+    window.fit_history.clear()
+    window.peak_shift_step.setValue(0.02)
+
+    window.shift_right_btn.click()
+    assert [peak.center_guess for peak in window.fitter.peaks] == pytest.approx(
+        [44.02, 46.02]
+    )
+
+    window.peak_shift_slider.setValue(-2)
+    window.apply_peak_shift_from_slider()
+    assert [peak.center_guess for peak in window.fitter.peaks] == pytest.approx(
+        [43.98, 45.98]
+    )
+    assert window.peak_shift_slider.value() == 0
+    assert not window.fit_history.can_undo
+
+    window.close()
+    app.processEvents()
+
+
+def _install_displayed_fit(
+    window: XRDAnalyzerGUI,
+    *,
+    centers: tuple[float, float],
+    total_curve: np.ndarray,
+    component_curves: tuple[np.ndarray, np.ndarray],
+) -> None:
+    params = lmfit.Parameters()
+    params.add("c", value=1.0)
+    for peak, center, component in zip(
+        window.fitter.peaks,
+        centers,
+        component_curves,
+    ):
+        peak.center = center
+        peak.area = float(np.trapz(component, window.fitter.x_data))
+        peak.height = float(np.max(component))
+        peak.fwhm = 0.2
+        peak.eta = 0.5
+        prefix = f"p{peak.peak_id}_"
+        params.add(f"{prefix}center", value=center)
+        params.add(f"{prefix}amplitude", value=peak.area)
+        params.add(f"{prefix}sigma", value=0.1)
+        params.add(f"{prefix}fraction", value=0.5)
+
+    window.fitter.result = SimpleNamespace(
+        params=params,
+        chisqr=1.0,
+        success=True,
+        message="synthetic",
+        nfev=1,
+        covar=np.eye(1),
+    )
+    window.fitter.y_fit = np.asarray(total_curve, dtype=float)
+    window.fitter.fit_mask = np.ones_like(total_curve, dtype=bool)
+    window.fitter.fit_config = {"objective_mode": "linear", "exclude_ranges": []}
+    window.fitter.fit_diagnostics = {"success": True}
+    curves = {
+        peak.peak_id: np.asarray(curve, dtype=float)
+        for peak, curve in zip(window.fitter.peaks, component_curves)
+    }
+    window.fitter.get_individual_peaks = lambda: curves
+    window.reporter = Reporter(window.fitter)
+    window.reporter.calculate_metrics()
+    window.update_peak_table()
+    window.plot_fitted_results()
+
+
+def test_live_fit_legend_uses_total_and_peak_names_only() -> None:
+    app, window = _window_with_two_peaks()
+    x_data = window.fitter.x_data
+    first = np.exp(-((x_data - 44.0) / 0.2) ** 2)
+    second = 0.5 * np.exp(-((x_data - 46.0) / 0.3) ** 2)
+    _install_displayed_fit(
+        window,
+        centers=(44.0, 46.0),
+        total_curve=1.0 + first + second,
+        component_curves=(first, second),
+    )
+
+    labels = [text.get_text() for text in window.plot_canvas.axes.get_legend().texts]
+
+    assert "Total" in labels
+    assert "004" in labels
+    assert "200" in labels
+    assert not any("Peak 0" in label or "Peak 1" in label for label in labels)
+    assert "Fit" not in labels
+
+    window.close()
+    app.processEvents()
+
+
+def test_undo_redo_restores_table_and_complete_fitted_plot() -> None:
+    app, window = _window_with_two_peaks()
+    x_data = window.fitter.x_data
+    first_a = np.exp(-((x_data - 44.0) / 0.2) ** 2)
+    second_a = 0.5 * np.exp(-((x_data - 46.0) / 0.3) ** 2)
+    total_a = 1.0 + first_a + second_a
+    _install_displayed_fit(
+        window,
+        centers=(44.0, 46.0),
+        total_curve=total_a,
+        component_curves=(first_a, second_a),
+    )
+    window.fit_history.clear()
+    window.record_completed_fit()
+
+    first_b = 1.2 * np.exp(-((x_data - 44.2) / 0.25) ** 2)
+    second_b = 0.7 * np.exp(-((x_data - 46.2) / 0.35) ** 2)
+    total_b = 1.0 + first_b + second_b
+    _install_displayed_fit(
+        window,
+        centers=(44.2, 46.2),
+        total_curve=total_b,
+        component_curves=(first_b, second_b),
+    )
+    window.record_completed_fit()
+
+    window.undo_fit_result()
+    assert window.peak_table.item(0, 2).text() == "44.000"
+    assert window.reporter is not None
+    total_line = next(
+        line for line in window.plot_canvas.axes.lines if line.get_label() == "Total"
+    )
+    assert total_line.get_ydata() == pytest.approx(total_a)
+
+    window.redo_fit_result()
+    assert window.peak_table.item(0, 2).text() == "44.200"
+    total_line = next(
+        line for line in window.plot_canvas.axes.lines if line.get_label() == "Total"
+    )
+    assert total_line.get_ydata() == pytest.approx(total_b)
 
     window.close()
     app.processEvents()
@@ -404,8 +622,6 @@ def test_fwhm_edit_outside_peak_type_bounds_is_rejected(monkeypatch) -> None:
 def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     app, window = _window_with_two_peaks()
     window.reporter = object()
-    window.results_text.setPlainText("stale fit")
-    window.physics_text.setPlainText("stale physics")
     window.filter_combo.setCurrentIndex(2)
     window.sg_window.setValue(11)
     window.bg_combo.setCurrentIndex(1)
@@ -417,7 +633,6 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     window.bg_spin.setValue(1.5)
     window.bg_fix_cb.setChecked(True)
     window.log_radio.setChecked(True)
-    window.peak_threshold.setValue(250.0)
     window.peak_input_mode.setCurrentIndex(
         window.peak_input_mode.findData("d_spacing")
     )
@@ -425,6 +640,7 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     window.peak_type_combo.setCurrentIndex(1)
     window.peak_name_input.setText("002")
     window.wavelength_spin.setValue(2.0)
+    window.peak_shift_step.setValue(0.2)
     monkeypatch.setattr(
         "xrd_gui.QMessageBox.question",
         lambda *args: QMessageBox.Yes,
@@ -435,8 +651,6 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     assert window.fitter is None
     assert window.reporter is None
     assert window.peak_table.rowCount() == 0
-    assert window.results_text.toPlainText() == ""
-    assert window.physics_text.toPlainText() == ""
     assert window.filter_combo.currentText() == "无"
     assert window.sg_window.value() == 7
     assert window.bg_combo.currentText() == "无"
@@ -452,7 +666,6 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     assert window.bg_spin.value() == pytest.approx(0.0)
     assert window.bg_fix_cb.isChecked() is False
     assert window.linear_radio.isChecked() is True
-    assert window.peak_threshold.value() == pytest.approx(100.0)
     assert window.peak_input_mode.currentData() == "two_theta"
     assert window.peak_value_input.value() == pytest.approx(44.0)
     assert window.peak_type_combo.currentData() == "film"
@@ -460,6 +673,7 @@ def test_reset_app_restores_a_clean_analysis_session(monkeypatch) -> None:
     assert window.wavelength_spin.value() == pytest.approx(
         DEFAULT_WAVELENGTH_ANGSTROM
     )
+    assert window.peak_shift_step.value() == pytest.approx(0.01)
     assert window.range_min.value() == pytest.approx(20.0)
     assert window.range_max.value() == pytest.approx(120.0)
 
@@ -580,10 +794,10 @@ def test_excel_project_load_restores_data_peaks_and_gui_controls(tmp_path) -> No
             "yscale": "log",
             "include_ranges_text": "43.5-44.5",
             "exclude_ranges_text": "",
-            "peak_threshold": 80.0,
             "wavelength_angstrom": 1.2345,
             "radiation_label": "自定义波长",
             "peak_input_mode": "d_spacing",
+            "peak_shift_step_2theta_deg": 0.025,
             "preprocessing_steps": [
                 {"operation": "gaussian", "parameters": {"sigma": 1.5}}
             ],
@@ -624,6 +838,7 @@ def test_excel_project_load_restores_data_peaks_and_gui_controls(tmp_path) -> No
     assert window.include_ranges_input.text() == "43.5-44.5"
     assert window.wavelength_spin.value() == pytest.approx(1.2345)
     assert window.peak_input_mode.currentData() == "d_spacing"
+    assert window.peak_shift_step.value() == pytest.approx(0.025)
     assert window.reporter.wavelength_angstrom == pytest.approx(1.2345)
     assert window.fitter.result is not None
     assert window.reporter is not None
@@ -701,8 +916,6 @@ def test_delete_peak_after_full_plot_redraw_is_safe_and_clears_stale_results() -
     window.fitter.result = object()
     window.fitter.y_fit = window.y_data.copy()
     window.reporter = object()
-    window.results_text.setPlainText("stale fit")
-    window.physics_text.setPlainText("stale physics")
 
     # Fitted-result plotting performs this full redraw and detaches the old marker artists.
     window.plot_canvas.axes.clear()
@@ -714,8 +927,6 @@ def test_delete_peak_after_full_plot_redraw_is_safe_and_clears_stale_results() -
     assert window.peak_table.rowCount() == 1
     assert window.fitter.result is None
     assert window.reporter is None
-    assert window.results_text.toPlainText() == ""
-    assert window.physics_text.toPlainText() == ""
     assert window.plot_canvas.peak_markers
     assert all(marker.axes is window.plot_canvas.axes for marker in window.plot_canvas.peak_markers)
 

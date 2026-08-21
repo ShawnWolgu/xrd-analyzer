@@ -2,9 +2,9 @@
 
 ## Project purpose
 
-This repository is a scientific Python desktop application for loading XRD scans,
-preprocessing intensity data, fitting Pseudo-Voigt peaks, and exporting fit and
-derived quantities for PZT thin-film analysis.
+This repository is a general-purpose scientific Python desktop application for loading XRD
+scans, preprocessing intensity data, fitting Pseudo-Voigt peaks, restoring analysis projects,
+and exporting fitted and derived quantities.
 
 Treat numerical meaning and provenance as part of the public API. A refactor is not
 successful if it preserves the GUI but changes scientific results without an explicit,

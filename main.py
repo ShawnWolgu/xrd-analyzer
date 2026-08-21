@@ -6,6 +6,8 @@ import importlib
 import sys
 from collections.abc import Sequence
 
+from app_metadata import startup_banner_text
+
 
 REQUIRED_PACKAGES = {
     "PyQt5": "PyQt5",
@@ -43,6 +45,7 @@ def _print_missing_packages(packages: Sequence[str]) -> None:
 
 def main() -> int:
     """Create the desktop application and run its event loop."""
+    print(startup_banner_text())
     missing_packages = find_missing_packages()
     if missing_packages:
         _print_missing_packages(missing_packages)

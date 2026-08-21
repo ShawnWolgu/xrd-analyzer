@@ -1,13 +1,15 @@
 # XRD Analyzer
 
-XRD Analyzer is an experimental Python desktop application for loading X-ray diffraction
-scans, preprocessing intensity data, fitting Pseudo-Voigt peaks, and exporting fit results and
-derived quantities for PZT thin-film analysis.
+Current release: **v1.0.0**
 
-The repository is currently in a foundation refactor. The existing GUI remains usable, but
-legacy numerical output must not yet be treated as independently validated scientific ground
-truth. See [Scientific validation](docs/scientific-validation.md) before using derived values in
-a publication or formal report.
+XRD Analyzer is a general-purpose Python desktop application for loading X-ray diffraction
+scans, preprocessing intensity data, fitting Pseudo-Voigt peaks, restoring analysis projects,
+and exporting fitted and derived quantities.
+
+Version 1.0 establishes the maintained application baseline. Passing regression tests protect
+the documented software behavior, but numerical output must not be treated as independently
+validated scientific ground truth. See [Scientific validation](docs/scientific-validation.md)
+before using derived values in a publication or formal report.
 
 The program reports the direct Bragg `d` spacing as a reflection-specific characteristic
 length. Peak labels such as 002, 004, 111, 200, 222, or 400 do not trigger lattice-constant
@@ -23,13 +25,19 @@ multipliers or tetragonality inference.
   applying the same controls twice no longer compounds filtering.
 - Enforce a one-way frontend/backend dependency boundary: the PyQt frontend imports XRD
   behavior only through `xrd_backend.py`, while the backend dependency closure contains no PyQt.
-- Add peaks manually or through automatic peak detection.
+- Add peaks manually by numerical input or by clicking the plotted scan.
 - Add a numerical peak either from its `2theta` position or by converting a theoretical
   interplanar spacing `d` with the first-order Bragg relation.
+- Import reusable TXT peak lists, or export active fitted peak positions to the same project
+  `database/` directory in a round-trip-compatible format.
+- Shift every configured peak and its search bounds by a common, explicit `2theta` offset using
+  step buttons or a centered slider; shifting invalidates the previous fitted result.
 - Fit constant-background plus Pseudo-Voigt peak models with `lmfit`.
 - Select Linear, Log, or Mixed objectives with a visible Log intensity floor `I0`.
 - Manually include or exclude 2theta ranges without modifying the loaded scan.
 - Keep each peak in optimize, frozen-complete-shape, or disabled state.
+- Undo and redo among the five most recent completed fitting results, restoring both table values
+  and displayed total/component curves without recording intermediate configuration edits.
 - Review solver convergence and boundary diagnostics before accepting a result as the next
   fitting guess.
 - Display `R²_fit` only on the points that actually enter the current optimization, in linear

@@ -32,6 +32,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional
+
+from plot_style import apply_plot_style
+
+
+apply_plot_style()
 import argparse
 
 

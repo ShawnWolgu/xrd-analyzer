@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xrd-analyzer"
-version = "0.1.0"
-description = "Desktop XRD peak fitting and reporting tool for PZT thin-film analysis"
+version = "1.0.0"
+description = "General-purpose desktop XRD analysis, peak fitting, and reporting tool"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -34,8 +34,10 @@ Repository = "https://github.com/ShawnWolgu/xrd-analyzer"
 
 [tool.setuptools]
 py-modules = [
+  "app_metadata",
   "convert_csv_to_txt",
   "main",
+  "plot_style",
   "plot_from_excel",
   "xrd_backend",
   "xrd_crystallography",

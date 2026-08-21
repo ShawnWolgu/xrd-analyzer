@@ -88,8 +88,8 @@ The current tests establish only that:
 - zero-intensity Log residual behavior is analytically verified for a visible `I0`, while the
   selection of `I0` for an experiment remains a user scientific decision.
 
-They do not validate the complete fitting workflow against instrument standards, certified PZT
-reference data, or an independent peak-fitting implementation.
+They do not validate the complete fitting workflow against certified reference materials,
+instrument standards, or an independent peak-fitting implementation.
 
 ## Required evidence for scientific corrections
 

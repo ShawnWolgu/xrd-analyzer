@@ -1,16 +1,19 @@
 # xrd_analyzer.py - 核心处理引擎
 
 import json
+from copy import deepcopy
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
 import lmfit
 from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from typing import Dict, Iterable, List, Optional, Tuple
 import warnings
+
+from plot_style import apply_plot_style
 
 from xrd_preprocessing import Preprocessor
 from xrd_io import DataLoader
@@ -19,8 +22,11 @@ from xrd_crystallography import (
     DEFAULT_RADIATION_LABEL,
     DEFAULT_WAVELENGTH_ANGSTROM,
 )
-from xrd_peaks import Peak, PSEUDO_VOIGT_FWHM_FACTOR
+from xrd_peaks import Peak, PeakSnapshot, PSEUDO_VOIGT_FWHM_FACTOR
 from xrd_project import ProjectWorkbook, RestoredFitResult
+
+
+apply_plot_style()
 
 
 PROJECT_WORKBOOK_SCHEMA_VERSION = 3
@@ -48,6 +54,7 @@ class Fitter:
         self.fit_diagnostics = {}
         self.fit_warnings = []
         self.result_accepted = False
+        self.restored_peak_curves = None
 
     def invalidate_fit_state(self) -> None:
         """峰配置改变后清除不再对应当前模型的拟合状态。"""
@@ -58,6 +65,7 @@ class Fitter:
         self.background = None
         self.fit_diagnostics = {}
         self.fit_warnings = []
+        self.restored_peak_curves = None
         for peak in self.peaks:
             peak.clear_result()
 
@@ -190,24 +198,49 @@ class Fitter:
         self.peaks.clear()
         self.invalidate_fit_state()
         return removed_count
+
+    def shift_peaks(self, delta_2theta_deg: float) -> int:
+        """将全部峰中心和搜索边界整体平移指定的2theta角度。"""
+        delta = float(delta_2theta_deg)
+        if not np.isfinite(delta):
+            raise ValueError("峰位平移量必须是有限的2θ角度")
+        if not self.peaks or delta == 0.0:
+            return 0
+
+        finite_x = np.asarray(self.x_data)[np.isfinite(self.x_data)]
+        if finite_x.size == 0:
+            raise ValueError("当前XRD数据不包含有效的2θ坐标")
+        data_min = float(np.min(finite_x))
+        data_max = float(np.max(finite_x))
+
+        shifted = []
+        for peak in self.peaks:
+            effective_center = (
+                float(peak.center)
+                if peak.center is not None
+                else float(peak.center_guess)
+            )
+            new_center = effective_center + delta
+            if not data_min <= new_center <= data_max:
+                raise ValueError(
+                    f"平移后的峰位2θ={new_center:.6f}°超出当前数据范围"
+                    f"{data_min:.6f}–{data_max:.6f}°"
+                )
+            bounds_width = float(peak.bounds[1] - peak.bounds[0])
+            shifted.append(
+                (peak, new_center, (new_center - bounds_width / 2, new_center + bounds_width / 2))
+            )
+
+        for peak, new_center, new_bounds in shifted:
+            peak.center_guess = new_center
+            peak.bounds = new_bounds
+        self.invalidate_fit_state()
+        return len(shifted)
     
     def update_guesses_from_result(self):
         """兼容旧调用；明确接受当前完整峰形作为下一轮初值。"""
         if self.result is not None:
             self.accept_current_result()
-    
-    def auto_find_peaks(self, height_threshold: float = None,
-                       distance: int = 10) -> List[float]:
-        """自动寻峰"""
-        if height_threshold is None:
-            height_threshold = np.max(self.y_data) * 0.1
-        
-        peaks_idx, properties = find_peaks(self.y_data, 
-                                          height=height_threshold,
-                                          distance=distance)
-        
-        peak_positions = self.x_data[peaks_idx]
-        return peak_positions.tolist()
     
     def build_model(self, constrain_fwhm: bool = False,
                    min_peak_separation: float = 0.2,
@@ -272,7 +305,7 @@ class Fitter:
                 # 基底峰通常很窄
                 initial_sigma = 0.05
             else:
-                # 薄膜峰较宽
+                # 样品峰使用较宽的通用初值；内部类型名保留为film以兼容旧项目。
                 initial_sigma = 0.15
             
             # 设置Sigma参数；FWHM范围由精确关系FWHM=2*sigma确定。
@@ -592,6 +625,12 @@ class Fitter:
         """获取各个峰的独立曲线"""
         if self.result is None:
             return {}
+
+        if self.restored_peak_curves is not None:
+            return {
+                peak_id: curve.copy()
+                for peak_id, curve in self.restored_peak_curves.items()
+            }
         
         peak_curves = {}
         
@@ -618,6 +657,176 @@ class Fitter:
                 "run a new fit to generate a fresh lmfit report."
             )
         return lmfit.fit_report(self.result)
+
+
+def _snapshot_array(values) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    copied = np.array(values, copy=True)
+    copied.setflags(write=False)
+    return copied
+
+
+@dataclass(frozen=True)
+class FitterSnapshot:
+    """Complete peak-table and fitted-plot state for undo/redo."""
+
+    peaks: Tuple[PeakSnapshot, ...]
+    has_result: bool
+    y_fit: Optional[np.ndarray]
+    background: Optional[np.ndarray]
+    fit_mask: Optional[np.ndarray]
+    fit_config: Dict
+    fit_diagnostics: Dict
+    fit_warnings: Tuple[str, ...]
+    result_accepted: bool
+    result_chisqr: float
+    result_success: bool
+    result_message: str
+    result_nfev: int
+    parameter_values: Tuple[Tuple[str, float], ...]
+    peak_curves: Tuple[Tuple[int, np.ndarray], ...]
+
+    @classmethod
+    def capture(cls, fitter: Optional[Fitter]) -> "FitterSnapshot":
+        if fitter is None:
+            return cls(
+                peaks=(),
+                has_result=False,
+                y_fit=None,
+                background=None,
+                fit_mask=None,
+                fit_config={},
+                fit_diagnostics={},
+                fit_warnings=(),
+                result_accepted=False,
+                result_chisqr=np.nan,
+                result_success=False,
+                result_message="",
+                result_nfev=0,
+                parameter_values=(),
+                peak_curves=(),
+            )
+
+        result = fitter.result
+        has_result = (
+            result is not None
+            and fitter.y_fit is not None
+            and hasattr(result, 'params')
+        )
+        parameter_values = ()
+        peak_curves = ()
+        if has_result:
+            parameter_values = tuple(
+                (name, float(parameter.value))
+                for name, parameter in result.params.items()
+            )
+            peak_curves = tuple(
+                (peak_id, _snapshot_array(curve))
+                for peak_id, curve in fitter.get_individual_peaks().items()
+            )
+
+        return cls(
+            peaks=tuple(PeakSnapshot.from_peak(peak) for peak in fitter.peaks),
+            has_result=has_result,
+            y_fit=_snapshot_array(fitter.y_fit),
+            background=_snapshot_array(fitter.background),
+            fit_mask=_snapshot_array(fitter.fit_mask),
+            fit_config=deepcopy(fitter.fit_config),
+            fit_diagnostics=deepcopy(fitter.fit_diagnostics),
+            fit_warnings=tuple(fitter.fit_warnings),
+            result_accepted=bool(fitter.result_accepted),
+            result_chisqr=float(getattr(result, 'chisqr', np.nan)),
+            result_success=bool(getattr(result, 'success', False)),
+            result_message=str(getattr(result, 'message', '')),
+            result_nfev=int(getattr(result, 'nfev', 0)),
+            parameter_values=parameter_values,
+            peak_curves=peak_curves,
+        )
+
+    def restore_into(self, fitter: Fitter) -> Fitter:
+        fitter.peaks = [snapshot.to_peak() for snapshot in self.peaks]
+        fitter.fit_config = deepcopy(self.fit_config)
+        fitter.fit_diagnostics = deepcopy(self.fit_diagnostics)
+        fitter.fit_warnings = list(self.fit_warnings)
+        fitter.result_accepted = self.result_accepted
+        fitter.fit_mask = (
+            self.fit_mask.copy()
+            if self.fit_mask is not None
+            else np.ones_like(fitter.x_data, dtype=bool)
+        )
+        fitter.background = (
+            self.background.copy() if self.background is not None else None
+        )
+        fitter.y_fit = self.y_fit.copy() if self.y_fit is not None else None
+        fitter.restored_peak_curves = (
+            {peak_id: curve.copy() for peak_id, curve in self.peak_curves}
+            if self.has_result
+            else None
+        )
+
+        if self.has_result:
+            params = lmfit.Parameters()
+            for name, value in self.parameter_values:
+                params.add(name, value=value)
+            fitter.params = params
+            fitter.result = RestoredFitResult(
+                params=params,
+                success=self.result_success,
+                message=self.result_message or 'Restored from peak history',
+                nfev=self.result_nfev,
+                covar=None,
+                chisqr=self.result_chisqr,
+            )
+        return fitter
+
+
+class FitterHistory:
+    """Bounded timeline containing completed fitting results only."""
+
+    def __init__(self, limit: int = 5):
+        if limit < 1:
+            raise ValueError("拟合历史步数必须至少为1")
+        self.limit = limit
+        self._states: List[FitterSnapshot] = []
+        self._index = -1
+
+    @property
+    def can_undo(self) -> bool:
+        return self._index > 0
+
+    @property
+    def can_redo(self) -> bool:
+        return 0 <= self._index < len(self._states) - 1
+
+    def clear(self) -> None:
+        self._states.clear()
+        self._index = -1
+
+    def record(self, fitter: Optional[Fitter]) -> bool:
+        """Append one completed fit and discard any forward branch."""
+        snapshot = FitterSnapshot.capture(fitter)
+        if not snapshot.has_result:
+            return False
+        if self._index < len(self._states) - 1:
+            del self._states[self._index + 1:]
+        self._states.append(snapshot)
+        if len(self._states) > self.limit:
+            del self._states[:len(self._states) - self.limit]
+        self._index = len(self._states) - 1
+        return True
+
+    def undo(self) -> Optional[FitterSnapshot]:
+        if not self.can_undo:
+            return None
+        self._index -= 1
+        return self._states[self._index]
+
+    def redo(self) -> Optional[FitterSnapshot]:
+        if not self.can_redo:
+            return None
+        self._index += 1
+        return self._states[self._index]
 
 
 class Reporter:

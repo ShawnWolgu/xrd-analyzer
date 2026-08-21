@@ -7,12 +7,10 @@ XRD分析系统使用示例
 通过编程方式使用核心分析引擎。
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 
 from xrd_analyzer import (
-    DataLoader, Preprocessor, Fitter, Reporter, Peak
+    DataLoader, Preprocessor, Fitter, Reporter
 )
 
 
@@ -120,57 +118,6 @@ def example_full_analysis(file_path):
     print("=" * 60)
 
 
-def example_auto_peak_finding(file_path):
-    """自动寻峰示例"""
-    
-    print("自动寻峰示例")
-    print("-" * 40)
-    
-    # 加载数据
-    x_data, y_data = DataLoader.load_txt(file_path)
-    x_data, y_data = DataLoader.trim_range(x_data, y_data, 40, 50)
-    
-    # 预处理
-    y_data = Preprocessor.apply_savgol_filter(y_data, 11, 3)
-    
-    # 自动寻峰
-    fitter = Fitter(x_data, y_data)
-    peak_positions = fitter.auto_find_peaks(
-        height_threshold=np.max(y_data) * 0.1,
-        distance=10
-    )
-    
-    print(f"找到 {len(peak_positions)} 个峰:")
-    for i, pos in enumerate(peak_positions):
-        print(f"  Peak {i}: 2θ = {pos:.3f}°")
-    
-    # 自动添加这些峰
-    for pos in peak_positions:
-        fitter.add_peak(pos, (pos - 0.3, pos + 0.3), 'film')
-    
-    # 执行拟合
-    fitter.build_model()
-    result = fitter.execute_fitting()
-    
-    # 绘图
-    plt.figure(figsize=(10, 6))
-    plt.scatter(x_data, y_data, s=10, alpha=0.5, label='Data')
-    plt.plot(x_data, fitter.y_fit, 'r-', linewidth=2, label='Fit')
-    
-    peak_curves = fitter.get_individual_peaks()
-    for peak_id, curve in peak_curves.items():
-        plt.plot(x_data, curve, '--', linewidth=1.5, alpha=0.7,
-                label=f'Peak {peak_id}')
-    
-    plt.xlabel('2θ (degree)')
-    plt.ylabel('Intensity (a.u.)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('auto_peak_finding.png', dpi=300)
-    print("\n图片已保存: auto_peak_finding.png")
-
-
 if __name__ == '__main__':
     # 使用示例
     # 请替换为您的实际文件路径
@@ -178,8 +125,5 @@ if __name__ == '__main__':
     # 示例1: 完整分析
     # file_path = "path/to/your/xrd_data.txt"
     # example_full_analysis(file_path)
-    
-    # 示例2: 自动寻峰
-    # example_auto_peak_finding(file_path)
     
     print("请取消注释上面的代码行并指定您的数据文件路径")

@@ -14,11 +14,70 @@ from xrd_analyzer import (
     DEFAULT_WAVELENGTH_ANGSTROM,
     BraggGeometry,
     Fitter,
+    FitterHistory,
     Peak,
     PROJECT_WORKBOOK_SCHEMA_VERSION,
     ProjectWorkbook,
     Reporter,
 )
+def test_fitter_history_round_trips_fitted_curves_parameters_and_mask() -> None:
+    x_data = np.linspace(43.0, 45.0, 21)
+    fitter = Fitter(x_data, np.ones_like(x_data))
+    peak = fitter.add_peak(44.0, name="004")
+    peak.center = 44.1
+    peak.area = 12.0
+    peak.height = 5.0
+    peak.fwhm = 0.2
+    peak.eta = 0.4
+    params = lmfit.Parameters()
+    params.add("c", value=1.0)
+    params.add("p0_center", value=44.1)
+    params.add("p0_amplitude", value=12.0)
+    params.add("p0_sigma", value=0.1)
+    params.add("p0_fraction", value=0.4)
+    fitter.result = SimpleNamespace(
+        params=params,
+        chisqr=2.0,
+        success=True,
+        message="complete",
+        nfev=4,
+    )
+    fitter.y_fit = np.linspace(1.0, 2.0, x_data.size)
+    fitter.fit_mask = np.arange(x_data.size) % 2 == 0
+    fitter.fit_config = {"objective_mode": "linear"}
+    fitter.fit_diagnostics = {"success": True, "nfev": 4}
+    fitter.restored_peak_curves = {0: np.linspace(0.0, 1.0, x_data.size)}
+
+    history = FitterHistory(limit=5)
+    assert history.record(fitter)
+    assert not history.can_undo
+
+    fitter.y_fit[:] = -1.0
+    fitter.peaks[0].center = 44.5
+    fitter.result.params["p0_center"].set(value=44.5)
+    assert history.record(fitter)
+
+    snapshot = history.undo()
+    assert snapshot is not None
+    restored = snapshot.restore_into(Fitter(x_data, np.ones_like(x_data)))
+
+    assert restored.peaks[0].center == pytest.approx(44.1)
+    assert restored.y_fit == pytest.approx(np.linspace(1.0, 2.0, x_data.size))
+    assert restored.fit_mask.tolist() == (np.arange(x_data.size) % 2 == 0).tolist()
+    assert restored.result.params["p0_center"].value == pytest.approx(44.1)
+    assert restored.get_individual_peaks()[0] == pytest.approx(
+        np.linspace(0.0, 1.0, x_data.size)
+    )
+
+
+def test_fitter_history_ignores_states_without_completed_fit() -> None:
+    fitter = Fitter(np.array([43.0, 44.0]), np.array([1.0, 2.0]))
+    fitter.add_peak(43.5)
+    history = FitterHistory(limit=5)
+
+    assert not history.record(fitter)
+    assert not history.can_undo
+    assert not history.can_redo
 
 
 def test_first_order_bragg_inverse_is_exact_and_round_trips() -> None:
@@ -106,6 +165,27 @@ def test_peak_area_is_the_fitted_lmfit_amplitude() -> None:
 def test_fwhm_bounds_are_exactly_twice_the_sigma_bounds() -> None:
     assert Fitter.fwhm_bounds("film") == pytest.approx((0.02, 3.0))
     assert Fitter.fwhm_bounds("substrate") == pytest.approx((0.02, 2.0))
+
+
+def test_shift_peaks_moves_effective_centers_and_bounds_atomically() -> None:
+    fitter = Fitter(np.linspace(40.0, 50.0, 101), np.ones(101))
+    first = fitter.add_peak(43.0, (42.5, 43.5), name="first")
+    second = fitter.add_peak(47.0, (46.75, 47.25), name="second")
+    first.center = 43.2
+    fitter.result = SimpleNamespace(params=lmfit.Parameters())
+    fitter.y_fit = np.ones(101)
+
+    assert fitter.shift_peaks(0.1) == 2
+    assert [peak.center_guess for peak in fitter.peaks] == pytest.approx([43.3, 47.1])
+    assert fitter.peaks[0].bounds == pytest.approx((42.8, 43.8))
+    assert fitter.peaks[1].bounds == pytest.approx((46.85, 47.35))
+    assert fitter.result is None
+    assert fitter.y_fit is None
+
+    previous = [(peak.center_guess, peak.bounds) for peak in fitter.peaks]
+    with pytest.raises(ValueError, match="数据范围"):
+        fitter.shift_peaks(3.0)
+    assert [(peak.center_guess, peak.bounds) for peak in fitter.peaks] == previous
 
 
 def test_accept_result_copies_all_independent_peak_shape_parameters() -> None:

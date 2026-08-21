@@ -9,12 +9,12 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTableWidget,
     QTableWidgetItem, QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox,
-    QComboBox, QTextEdit, QSplitter, QTabWidget, QMessageBox,
+    QComboBox, QSplitter, QTabWidget, QMessageBox,
     QProgressBar, QListWidget, QListWidgetItem, QRadioButton,
-    QButtonGroup, QDialog, QDialogButtonBox, QFormLayout
+    QButtonGroup, QDialog, QDialogButtonBox, QFormLayout, QSlider
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QColor
 
 import numpy as np
 import matplotlib
@@ -25,16 +25,22 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from threadpoolctl import threadpool_limits
 
+from app_metadata import WINDOW_TITLE
+from plot_style import apply_plot_style
+
 from xrd_backend import (
     AnalysisSession,
     BraggGeometry, DEFAULT_RADIATION_LABEL, DEFAULT_WAVELENGTH_ANGSTROM,
-    Fitter, PROJECT_WORKBOOK_SCHEMA_VERSION,
+    Fitter, FitterHistory, PROJECT_WORKBOOK_SCHEMA_VERSION,
     FitConfiguration,
     PSEUDO_VOIGT_FWHM_FACTOR, Reporter, RestoredFitResult, Peak,
     PreprocessingStep,
     ScanData,
     XRDApplicationService,
 )
+
+
+apply_plot_style()
 
 
 FITTING_THREAD_STACK_SIZE_BYTES = 16 * 1024 * 1024
@@ -148,7 +154,7 @@ class PeakConfigDialog(QDialog):
         
         # 峰名称
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("可选，例如: PZT(002)")
+        self.name_edit.setPlaceholderText("可选，例如: Sample(002)")
         layout.addRow("峰名称:", self.name_edit)
         
         # 峰中心
@@ -180,7 +186,8 @@ class PeakConfigDialog(QDialog):
         
         # 峰类型
         self.type_combo = QComboBox()
-        self.type_combo.addItems(['film', 'substrate'])
+        self.type_combo.addItem("样品峰", "film")
+        self.type_combo.addItem("基底峰", "substrate")
         layout.addRow("峰类型:", self.type_combo)
         
         # 按钮
@@ -199,7 +206,7 @@ class PeakConfigDialog(QDialog):
             'center': self.center_spin.value(),
             'min': self.min_spin.value(),
             'max': self.max_spin.value(),
-            'type': self.type_combo.currentText(),
+            'type': self.type_combo.currentData(),
             'name': self.name_edit.text().strip()
         }
 
@@ -296,6 +303,7 @@ class XRDAnalyzerGUI(QMainWindow):
         self.fitter = None
         self.reporter = None
         self.fit_thread = None
+        self.fit_history = FitterHistory(limit=5)
         
         self.init_ui()
 
@@ -355,11 +363,9 @@ class XRDAnalyzerGUI(QMainWindow):
             peak.clear_result()
         self.fitter = self.backend.create_fitter(old_peaks)
         self.reporter = None
-        self.results_text.clear()
-        self.physics_text.clear()
         
     def init_ui(self):
-        self.setWindowTitle("XRD数据分析系统 - PZT薄膜专用")
+        self.setWindowTitle(WINDOW_TITLE)
         self.setGeometry(100, 100, 1400, 900)
         
         # 中心部件
@@ -539,7 +545,7 @@ class XRDAnalyzerGUI(QMainWindow):
         fit_layout = QVBoxLayout()
         
         # 约束选项
-        self.constrain_fwhm_cb = QCheckBox("强制薄膜峰FWHM相等")
+        self.constrain_fwhm_cb = QCheckBox("强制样品峰FWHM相等")
         fit_layout.addWidget(self.constrain_fwhm_cb)
         
         # 最小峰间距
@@ -576,8 +582,6 @@ class XRDAnalyzerGUI(QMainWindow):
         weight_layout.addWidget(QLabel("Log权重:"))
         
         self.log_weight_slider = QSpinBox() # 使用SpinBox简单直观，或者Slider+SpinBox联动
-        from PyQt5.QtWidgets import QSlider # 确保引入
-        
         self.log_slider = QSlider(Qt.Horizontal)
         self.log_slider.setRange(0, 100)
         self.log_slider.setValue(50)
@@ -698,25 +702,13 @@ class XRDAnalyzerGUI(QMainWindow):
         # 添加上部区域到主布局
         main_layout.addWidget(top_section)
         
-        # === 下部区域：峰管理 (全宽) ===
+        # === 左下区域：峰识别与添加 ===
         
-        # 3. 峰管理组 (原 Group 3)
-        peak_group = QGroupBox("3. 峰识别与管理")
+        peak_group = QGroupBox("3. 峰识别与添加")
+        self.peak_setup_group = peak_group
+        # 保留旧属性供现有状态控制代码兼容使用。
         self.peak_group = peak_group
         peak_layout = QVBoxLayout()
-        
-        # 自动寻峰
-        auto_peak_layout = QHBoxLayout()
-        auto_peak_btn = QPushButton("自动寻峰")
-        auto_peak_btn.clicked.connect(self.auto_find_peaks)
-        auto_peak_layout.addWidget(auto_peak_btn)
-        
-        self.peak_threshold = QDoubleSpinBox()
-        self.peak_threshold.setRange(0, 100000)
-        self.peak_threshold.setValue(100)
-        self.peak_threshold.setPrefix("阈值: ")
-        auto_peak_layout.addWidget(self.peak_threshold)
-        peak_layout.addLayout(auto_peak_layout)
         
         # 数值添加：直接2θ或由理论晶面间距d反算
         quick_add_layout = QHBoxLayout()
@@ -734,12 +726,12 @@ class XRDAnalyzerGUI(QMainWindow):
         quick_add_layout.addWidget(self.peak_value_input)
 
         self.peak_type_combo = QComboBox()
-        self.peak_type_combo.addItem("薄膜", "film")
-        self.peak_type_combo.addItem("基底", "substrate")
+        self.peak_type_combo.addItem("样品峰", "film")
+        self.peak_type_combo.addItem("基底峰", "substrate")
         quick_add_layout.addWidget(self.peak_type_combo)
 
         self.peak_name_input = QLineEdit()
-        self.peak_name_input.setPlaceholderText("峰名，例如 PZT(002)")
+        self.peak_name_input.setPlaceholderText("峰名，例如 Sample(002)")
         quick_add_layout.addWidget(self.peak_name_input)
         
         quick_add_btn = QPushButton("添加")
@@ -769,9 +761,12 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 导入/导出峰
         io_peak_layout = QHBoxLayout()
-        import_peak_btn = QPushButton("导入峰列表 (.txt)")
+        import_peak_btn = QPushButton("导入峰位置 (.txt)")
         import_peak_btn.clicked.connect(self.import_peaks_from_file)
         io_peak_layout.addWidget(import_peak_btn)
+        export_peak_btn = QPushButton("导出拟合峰位置 (.txt)")
+        export_peak_btn.clicked.connect(self.export_fitted_peaks_to_file)
+        io_peak_layout.addWidget(export_peak_btn)
         peak_layout.addLayout(io_peak_layout)
         
         # 手动添加峰
@@ -781,7 +776,17 @@ class XRDAnalyzerGUI(QMainWindow):
         peak_layout.addWidget(manual_peak_btn)
         self.manual_peak_btn = manual_peak_btn
         
-        # 峰列表 (移除最大高度限制)
+        peak_group.setLayout(peak_layout)
+        main_layout.addWidget(peak_group, 1)
+
+        return panel
+
+    def create_peak_table_group(self) -> QGroupBox:
+        """创建位于图像下方、与图像同宽的峰管理表格。"""
+        peak_table_group = QGroupBox("峰值拟合管理")
+        self.peak_table_group = peak_table_group
+        table_layout = QVBoxLayout()
+
         self.peak_table = QTableWidget()
         self.peak_table.setColumnCount(9)
         self.peak_table.setHorizontalHeaderLabels(
@@ -794,7 +799,7 @@ class XRDAnalyzerGUI(QMainWindow):
             "拟合Pseudo-Voigt分布的积分面积（lmfit amplitude）"
         )
         self.peak_table.horizontalHeaderItem(5).setToolTip(
-            "Pseudo-Voigt半高全宽（2θ度）。薄膜峰允许0.02–3.00°，"
+            "Pseudo-Voigt半高全宽（2θ度）。样品峰允许0.02–3.00°，"
             "基底峰允许0.02–2.00°；勾选后按输入值精确固定。"
         )
         self.peak_table.horizontalHeaderItem(6).setToolTip(
@@ -819,10 +824,64 @@ class XRDAnalyzerGUI(QMainWindow):
         # Connect itemChanged signal for live editing
         self.peak_table.itemChanged.connect(self.on_peak_table_changed)
         
-        peak_layout.addWidget(self.peak_table)
+        table_layout.addWidget(self.peak_table)
+
+        shift_layout = QHBoxLayout()
+        shift_layout.addWidget(QLabel("整体平移 2θ:"))
+        self.shift_left_btn = QPushButton("◀")
+        self.shift_left_btn.setFixedWidth(32)
+        self.shift_left_btn.setToolTip("所有峰向左移动一个步长")
+        self.shift_left_btn.clicked.connect(
+            lambda: self.apply_peak_shift(-self.peak_shift_step.value())
+        )
+        shift_layout.addWidget(self.shift_left_btn)
+
+        self.peak_shift_slider = QSlider(Qt.Horizontal)
+        self.peak_shift_slider.setRange(-10, 10)
+        self.peak_shift_slider.setValue(0)
+        self.peak_shift_slider.setTickPosition(QSlider.TicksBelow)
+        self.peak_shift_slider.setTickInterval(1)
+        self.peak_shift_slider.setToolTip(
+            "拖动后释放：按滑块格数×步长整体平移所有峰，随后自动回中"
+        )
+        self.peak_shift_slider.sliderReleased.connect(
+            self.apply_peak_shift_from_slider
+        )
+        shift_layout.addWidget(self.peak_shift_slider, 1)
+
+        self.shift_right_btn = QPushButton("▶")
+        self.shift_right_btn.setFixedWidth(32)
+        self.shift_right_btn.setToolTip("所有峰向右移动一个步长")
+        self.shift_right_btn.clicked.connect(
+            lambda: self.apply_peak_shift(self.peak_shift_step.value())
+        )
+        shift_layout.addWidget(self.shift_right_btn)
+
+        shift_layout.addWidget(QLabel("步长:"))
+        self.peak_shift_step = QDoubleSpinBox()
+        self.peak_shift_step.setDecimals(4)
+        self.peak_shift_step.setRange(0.0001, 1.0)
+        self.peak_shift_step.setSingleStep(0.001)
+        self.peak_shift_step.setValue(0.01)
+        self.peak_shift_step.setSuffix(" °")
+        self.peak_shift_step.setToolTip("峰位整体平移步长，单位为degree 2θ")
+        shift_layout.addWidget(self.peak_shift_step)
+        table_layout.addLayout(shift_layout)
         
         # 删除峰按钮
         peak_btn_layout = QHBoxLayout()
+        self.undo_fit_btn = QPushButton("撤销")
+        self.undo_fit_btn.setShortcut("Ctrl+Z")
+        self.undo_fit_btn.setToolTip("回到上一次已完成的拟合结果（最多5步）")
+        self.undo_fit_btn.clicked.connect(self.undo_fit_result)
+        peak_btn_layout.addWidget(self.undo_fit_btn)
+
+        self.redo_fit_btn = QPushButton("恢复")
+        self.redo_fit_btn.setShortcut("Ctrl+Shift+Z")
+        self.redo_fit_btn.setToolTip("恢复下一次已完成的拟合结果")
+        self.redo_fit_btn.clicked.connect(self.redo_fit_result)
+        peak_btn_layout.addWidget(self.redo_fit_btn)
+
         delete_peak_btn = QPushButton("删除选中峰")
         delete_peak_btn.clicked.connect(self.delete_selected_peak)
         peak_btn_layout.addWidget(delete_peak_btn)
@@ -830,14 +889,11 @@ class XRDAnalyzerGUI(QMainWindow):
         clear_peaks_btn = QPushButton("清除所有峰")
         clear_peaks_btn.clicked.connect(self.clear_all_peaks)
         peak_btn_layout.addWidget(clear_peaks_btn)
-        peak_layout.addLayout(peak_btn_layout)
-        
-        peak_group.setLayout(peak_layout)
-        
-        # 添加峰管理组到主布局，并给予伸缩因子1，使其占据剩余空间
-        main_layout.addWidget(peak_group, 1)
-        
-        return panel
+        table_layout.addLayout(peak_btn_layout)
+        self.update_fit_history_buttons()
+
+        peak_table_group.setLayout(table_layout)
+        return peak_table_group
     
     def create_right_panel(self):
         """创建右侧绘图区域"""
@@ -862,31 +918,14 @@ class XRDAnalyzerGUI(QMainWindow):
         
         tabs.addTab(data_tab, "数据与拟合")
         
-        # Tab 2: 结果详情
-        results_tab = QWidget()
-        results_layout = QVBoxLayout()
-        
-        self.results_text = QTextEdit()
-        self.results_text.setReadOnly(True)
-        self.results_text.setFont(QFont("Courier", 10))
-        results_layout.addWidget(self.results_text)
-        
-        results_tab.setLayout(results_layout)
-        tabs.addTab(results_tab, "拟合结果")
-        
-        # Tab 3: 物理参数
-        physics_tab = QWidget()
-        physics_layout = QVBoxLayout()
-        
-        self.physics_text = QTextEdit()
-        self.physics_text.setReadOnly(True)
-        self.physics_text.setFont(QFont("Courier", 10))
-        physics_layout.addWidget(self.physics_text)
-        
-        physics_tab.setLayout(physics_layout)
-        tabs.addTab(physics_tab, "物理参数")
-        
-        layout.addWidget(tabs)
+        self.analysis_tabs = tabs
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.addWidget(tabs)
+        self.right_splitter.addWidget(self.create_peak_table_group())
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setSizes([600, 300])
+        layout.addWidget(self.right_splitter)
         
         return panel
     
@@ -916,10 +955,10 @@ class XRDAnalyzerGUI(QMainWindow):
             'yscale': self.plot_canvas.yscale,
             'include_ranges_text': self.include_ranges_input.text(),
             'exclude_ranges_text': self.exclude_ranges_input.text(),
-            'peak_threshold': self.peak_threshold.value(),
             'wavelength_angstrom': self.wavelength_spin.value(),
             'radiation_label': self.current_radiation_label(),
             'peak_input_mode': self.peak_input_mode.currentData(),
+            'peak_shift_step_2theta_deg': self.peak_shift_step.value(),
             'preprocessing_steps': [
                 step.to_record() for step in self.session.preprocessing
             ],
@@ -981,9 +1020,11 @@ class XRDAnalyzerGUI(QMainWindow):
         self.bg_fix_cb.setChecked(bool(state.get('background_fixed', False)))
         self.include_ranges_input.setText(str(state.get('include_ranges_text', '')))
         self.exclude_ranges_input.setText(str(state.get('exclude_ranges_text', '')))
-        self.peak_threshold.setValue(float(state.get('peak_threshold', 100.0)))
         self.wavelength_spin.setValue(
             float(state.get('wavelength_angstrom', DEFAULT_WAVELENGTH_ANGSTROM))
+        )
+        self.peak_shift_step.setValue(
+            float(state.get('peak_shift_step_2theta_deg', 0.01))
         )
         self._set_combo_data(
             self.peak_input_mode,
@@ -1033,8 +1074,6 @@ class XRDAnalyzerGUI(QMainWindow):
         self.clear_files()
         self.reporter = None
         self.peak_table.setRowCount(0)
-        self.results_text.clear()
-        self.physics_text.clear()
 
         self.current_file = str(file_path)
         self.last_data_dir = str(Path(file_path).parent)
@@ -1224,8 +1263,6 @@ class XRDAnalyzerGUI(QMainWindow):
             self.reporter.calculate_metrics()
             self.plot_fitted_results()
             self.update_peak_table()
-            self.display_results()
-            self.display_physics_parameters()
         else:
             self.reporter = None
             self.update_peak_table()
@@ -1304,6 +1341,7 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 同时也应该清除fitter，因为数据没了
         self.fitter = None
+        self.clear_fit_history()
         
         self.statusBar().showMessage('列表已清空')
 
@@ -1331,9 +1369,7 @@ class XRDAnalyzerGUI(QMainWindow):
             self.reporter = None
             self.fit_thread = None
 
-            # 清除结果显示。
-            self.results_text.clear()
-            self.physics_text.clear()
+            self.clear_fit_history()
 
             # 恢复所有会改变下一次分析的控件默认值。
             self.filter_combo.setCurrentIndex(0)
@@ -1352,12 +1388,13 @@ class XRDAnalyzerGUI(QMainWindow):
             self.bg_fix_cb.setChecked(False)
             self.linear_radio.setChecked(True)
             self.plot_canvas.yscale = 'linear'
-            self.peak_threshold.setValue(100.0)
             self.peak_input_mode.setCurrentIndex(0)
             self.peak_value_input.setValue(44.0)
             self.peak_type_combo.setCurrentIndex(0)
             self.peak_name_input.clear()
             self.wavelength_spin.setValue(DEFAULT_WAVELENGTH_ANGSTROM)
+            self.peak_shift_step.setValue(0.01)
+            self.peak_shift_slider.setValue(0)
 
             self.manual_peak_btn.setChecked(False)
             self.plot_canvas.mode = 'view'
@@ -1396,8 +1433,7 @@ class XRDAnalyzerGUI(QMainWindow):
             self.fitter = None
             self.reporter = None
             self.peak_table.setRowCount(0)
-            self.results_text.clear()
-            self.physics_text.clear()
+            self.clear_fit_history()
 
             if self.active_data_range is None:
                 self.range_min.setValue(x_merged.min())
@@ -1504,8 +1540,6 @@ class XRDAnalyzerGUI(QMainWindow):
             self.file_list_widget.addItem(item)
 
         self.reporter = None
-        self.results_text.clear()
-        self.physics_text.clear()
 
         removed_peak_count = 0
         if old_peaks:
@@ -1530,6 +1564,8 @@ class XRDAnalyzerGUI(QMainWindow):
             self.fitter = None
             self.peak_table.setRowCount(0)
             self.plot_canvas.set_data(self.x_data, self.y_data)
+
+        self.clear_fit_history()
 
         message = f"项目数据已裁剪至 {x_min:.2f}–{x_max:.2f}°"
         if removed_peak_count:
@@ -1609,36 +1645,11 @@ class XRDAnalyzerGUI(QMainWindow):
                 values['name']
             )
             
-    def auto_find_peaks(self):
-        """自动寻峰"""
-        if self.x_data is None or self.y_data is None:
-            QMessageBox.warning(self, "警告", "请先加载数据")
-            return
-        
-        # 创建临时fitter
-        temp_fitter = Fitter(self.x_data, self.y_data)
-        threshold = self.peak_threshold.value()
-        
-        peak_positions = temp_fitter.auto_find_peaks(height_threshold=threshold)
-        
-        if not peak_positions:
-            QMessageBox.information(self, "信息", "未找到峰")
-            return
-        
-        # 清除现有峰
-        self.clear_all_peaks()
-        
-        # 添加找到的峰
-        for pos in peak_positions:
-            self.add_peak_to_fitter(pos, (pos - 0.5, pos + 0.5), 'film')
-        
-        self.statusBar().showMessage(f'自动找到 {len(peak_positions)} 个峰')
-    
     def add_peak_to_fitter(self, center, bounds, peak_type, name=''):
         """添加峰到拟合器"""
         if self.fitter is None:
             self.fitter = Fitter(self.x_data, self.y_data)
-        
+
         self.fitter.add_peak(center, bounds, peak_type, name)
         self.refresh_after_peak_change()
 
@@ -1652,13 +1663,13 @@ class XRDAnalyzerGUI(QMainWindow):
             self.manual_peak_btn.setChecked(False)
             self.manual_peak_btn.setText("手动添加峰 (点击图上)")
             self.plot_canvas.mode = 'view'
-        self.peak_group.setEnabled(enabled)
+        self.peak_setup_group.setEnabled(enabled)
+        self.peak_table_group.setEnabled(enabled)
+        self.update_fit_history_buttons()
 
     def clear_stale_fit_display(self) -> None:
         """清除不再对应当前峰配置的结果展示。"""
         self.reporter = None
-        self.results_text.clear()
-        self.physics_text.clear()
 
     def redraw_peak_guesses(self) -> None:
         """以当前数据和峰初始位置重绘配置视图。"""
@@ -1685,6 +1696,71 @@ class XRDAnalyzerGUI(QMainWindow):
         self.update_peak_table()
         self.clear_stale_fit_display()
         self.redraw_peak_guesses()
+        self.update_fit_history_buttons()
+
+    def record_completed_fit(self) -> None:
+        """仅在一次拟合产生完整结果后追加历史节点。"""
+        self.fit_history.record(self.fitter)
+        self.update_fit_history_buttons()
+
+    def clear_fit_history(self) -> None:
+        """数据项目改变后清除不再适用的拟合结果历史。"""
+        self.fit_history.clear()
+        self.update_fit_history_buttons()
+
+    def update_fit_history_buttons(self) -> None:
+        if not hasattr(self, 'undo_fit_btn'):
+            return
+        enabled = not self.is_fitting()
+        self.undo_fit_btn.setEnabled(enabled and self.fit_history.can_undo)
+        self.redo_fit_btn.setEnabled(enabled and self.fit_history.can_redo)
+
+    def restore_fit_history_state(self, snapshot, action: str) -> None:
+        """恢复峰表格及与该状态对应的完整拟合展示。"""
+        if self.x_data is None or self.y_data is None:
+            return
+        self.fitter = Fitter(self.x_data, self.y_data)
+        snapshot.restore_into(self.fitter)
+        for peak_id, peak in enumerate(self.fitter.peaks):
+            peak.peak_id = peak_id
+        self.update_peak_table()
+
+        if self.fitter.result is not None and self.fitter.y_fit is not None:
+            self.reporter = Reporter(
+                self.fitter,
+                x_original=self.x_data_original,
+                y_original=self.y_data_original,
+                wavelength_angstrom=self.wavelength_spin.value(),
+                radiation_label=self.current_radiation_label(),
+            )
+            self.reporter.calculate_metrics()
+            self.plot_fitted_results()
+            status = f"已{action}到对应拟合结果"
+        else:
+            self.clear_stale_fit_display()
+            self.redraw_peak_guesses()
+            status = f"已{action}到对应拟合结果"
+
+        self.update_fit_history_buttons()
+        self.statusBar().showMessage(status)
+
+    def undo_fit_result(self) -> None:
+        """回退到上一个已完成的拟合结果。"""
+        if self.is_fitting():
+            return
+        restored = self.fit_history.undo()
+        if restored is None:
+            return
+        self.restore_fit_history_state(restored, "撤销")
+
+    def redo_fit_result(self) -> None:
+        """恢复下一个已完成的拟合结果。"""
+        if self.is_fitting():
+            return
+        restored = self.fit_history.redo()
+        if restored is None:
+            return
+        self.restore_fit_history_state(restored, "恢复")
         
     def update_peak_table(self):
         """更新峰表格"""
@@ -1792,7 +1868,10 @@ class XRDAnalyzerGUI(QMainWindow):
             self.peak_table.setCellWidget(i, 7, state_combo)
 
             # 8. 类型
-            self.peak_table.setItem(i, 8, QTableWidgetItem(peak.peak_type))
+            type_label = "基底峰" if peak.peak_type == "substrate" else "样品峰"
+            type_item = QTableWidgetItem(type_label)
+            type_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.peak_table.setItem(i, 8, type_item)
             
         self.peak_table.blockSignals(False)
 
@@ -1812,91 +1891,106 @@ class XRDAnalyzerGUI(QMainWindow):
         peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
         if not peak: return
         
-        # Sync CheckState first (locking)
-        if col == 2:
-            peak.fixed_center = (item.checkState() == Qt.Checked)
-        elif col == 4:
-            peak.fixed_height = (item.checkState() == Qt.Checked)
-        elif col == 5:
-            peak.fixed_fwhm = (item.checkState() == Qt.Checked)
-            
-        # Parse value for editing
+        text = item.text().strip()
+        value = None
         try:
-            text = item.text().strip()
-            if text == "NaN" or not text:
-                if col in {2, 4, 5}:
-                    self.invalidate_after_peak_edit()
+            if text and text != "NaN":
+                value = float(text)
+        except ValueError:
+            return
+
+        if col == 5 and value is not None:
+            fwhm_min, fwhm_max = Fitter.fwhm_bounds(peak.peak_type)
+            if not np.isfinite(value) or not fwhm_min <= value <= fwhm_max:
+                previous_fwhm = (
+                    peak.fwhm
+                    if peak.fwhm is not None
+                    else PSEUDO_VOIGT_FWHM_FACTOR * peak.sigma_guess
+                    if peak.sigma_guess is not None
+                    else None
+                )
+                self.peak_table.blockSignals(True)
+                item.setText(
+                    f"{previous_fwhm:.4f}"
+                    if previous_fwhm is not None
+                    else "NaN"
+                )
+                self.peak_table.blockSignals(False)
+                QMessageBox.warning(
+                    self,
+                    "FWHM超出范围",
+                    f"{peak.peak_type}峰的FWHM必须在 "
+                    f"{fwhm_min:.2f}–{fwhm_max:.2f}°（2θ）之间。",
+                )
                 return
-            val = float(text)
-            
+
+        if col == 6 and value is not None:
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                previous_eta = peak.eta if peak.eta is not None else peak.fraction_guess
+                self.peak_table.blockSignals(True)
+                item.setText(
+                    f"{previous_eta:.4f}" if previous_eta is not None else "NaN"
+                )
+                self.peak_table.blockSignals(False)
+                QMessageBox.warning(
+                    self,
+                    "η超出范围",
+                    "Pseudo-Voigt Lorentzian比例η必须在0和1之间。",
+                )
+                return
+
+        fixed_attribute = {
+            2: 'fixed_center',
+            4: 'fixed_height',
+            5: 'fixed_fwhm',
+        }.get(col)
+        fixed_changed = (
+            fixed_attribute is not None
+            and getattr(peak, fixed_attribute) != (item.checkState() == Qt.Checked)
+        )
+        value_changed = False
+        if col == 2 and value is not None:
+            value_changed = peak.center_guess != value or peak.center != value
+        elif col == 4 and value is not None:
+            value_changed = peak.height_guess != value or peak.height != value
+        elif col == 5 and value is not None:
+            value_changed = (
+                peak.sigma_guess != value / PSEUDO_VOIGT_FWHM_FACTOR
+                or peak.fwhm != value
+            )
+        elif col == 6 and value is not None:
+            value_changed = peak.fraction_guess != value or peak.eta != value
+
+        if not fixed_changed and not value_changed:
+            return
+
+        if fixed_changed:
+            setattr(peak, fixed_attribute, item.checkState() == Qt.Checked)
+
+        if value_changed:
             if col == 2: # Center
-                peak.center_guess = val
+                peak.center_guess = value
                 # Update bounds
                 if peak.bounds:
                     width = peak.bounds[1] - peak.bounds[0]
-                    peak.bounds = (val - width/2, val + width/2)
+                    peak.bounds = (value - width/2, value + width/2)
                 # Update center result too, so it persists
-                peak.center = val
+                peak.center = value
                 
             elif col == 4: # Height
-                peak.height_guess = val
-                peak.height = val
+                peak.height_guess = value
+                peak.height = value
                 
             elif col == 5: # FWHM
-                fwhm_min, fwhm_max = Fitter.fwhm_bounds(peak.peak_type)
-                if not np.isfinite(val) or not fwhm_min <= val <= fwhm_max:
-                    previous_fwhm = (
-                        peak.fwhm
-                        if peak.fwhm is not None
-                        else PSEUDO_VOIGT_FWHM_FACTOR * peak.sigma_guess
-                        if peak.sigma_guess is not None
-                        else None
-                    )
-                    self.peak_table.blockSignals(True)
-                    item.setText(
-                        f"{previous_fwhm:.4f}"
-                        if previous_fwhm is not None
-                        else "NaN"
-                    )
-                    self.peak_table.blockSignals(False)
-                    QMessageBox.warning(
-                        self,
-                        "FWHM超出范围",
-                        f"{peak.peak_type}峰的FWHM必须在 "
-                        f"{fwhm_min:.2f}–{fwhm_max:.2f}°（2θ）之间。",
-                    )
-                    return
-
                 # lmfit PseudoVoigtModel精确定义FWHM = 2 * sigma。
-                peak.sigma_guess = val / PSEUDO_VOIGT_FWHM_FACTOR
-                peak.fwhm = val
+                peak.sigma_guess = value / PSEUDO_VOIGT_FWHM_FACTOR
+                peak.fwhm = value
 
             elif col == 6: # Pseudo-Voigt fraction
-                if not np.isfinite(val) or not 0.0 <= val <= 1.0:
-                    previous_eta = (
-                        peak.eta
-                        if peak.eta is not None
-                        else peak.fraction_guess
-                    )
-                    self.peak_table.blockSignals(True)
-                    item.setText(
-                        f"{previous_eta:.4f}" if previous_eta is not None else "NaN"
-                    )
-                    self.peak_table.blockSignals(False)
-                    QMessageBox.warning(
-                        self,
-                        "η超出范围",
-                        "Pseudo-Voigt Lorentzian比例η必须在0和1之间。",
-                    )
-                    return
-                peak.fraction_guess = val
-                peak.eta = val
+                peak.fraction_guess = value
+                peak.eta = value
 
-            if col in {2, 4, 5, 6}:
-                self.invalidate_after_peak_edit()
-                
-        except ValueError:
-            pass # Ignore invalid input
+        self.invalidate_after_peak_edit()
 
     def invalidate_after_peak_edit(self) -> None:
         """峰参数或锁定状态改变后，确保下一次拟合重建模型。"""
@@ -1968,7 +2062,6 @@ class XRDAnalyzerGUI(QMainWindow):
             return
         self.reporter.wavelength_angstrom = self.wavelength_spin.value()
         self.reporter.radiation_label = self.current_radiation_label()
-        self.display_physics_parameters()
 
     def quick_add_peak(self):
         """按直接2θ或理论晶面间距d添加峰。"""
@@ -2016,12 +2109,16 @@ class XRDAnalyzerGUI(QMainWindow):
         else:
             self.statusBar().showMessage(f"已添加峰: 2θ = {center:.6f}° {name}")
 
+    @staticmethod
+    def peak_library_directory() -> Path:
+        """返回项目内峰列表的默认导入与导出目录。"""
+        program_dir = Path(__file__).resolve().parent
+        database_dir = program_dir / "database"
+        return database_dir if database_dir.is_dir() else program_dir
+
     def import_peaks_from_file(self):
         """从文件导入峰列表"""
-        # 确定初始目录: 程序所在目录/database
-        program_dir = Path(__file__).parent.absolute()
-        database_dir = program_dir / "database"
-        start_dir = str(database_dir) if database_dir.exists() else str(program_dir)
+        start_dir = str(self.peak_library_directory())
         
         file_path, _ = QFileDialog.getOpenFileName(
             self, "导入峰列表", start_dir, "Text Files (*.txt);;All Files (*)"
@@ -2037,7 +2134,7 @@ class XRDAnalyzerGUI(QMainWindow):
             x_max = self.x_data.max()
             
         try:
-            count = 0
+            peaks_to_add = []
             skipped = 0
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -2045,7 +2142,7 @@ class XRDAnalyzerGUI(QMainWindow):
                     if not line or line.startswith('#'):
                         continue
                         
-                    parts = [p.strip() for p in line.split('-')]
+                    parts = [p.strip() for p in line.split('-', 2)]
                     if len(parts) < 1:
                         continue
                         
@@ -2067,11 +2164,20 @@ class XRDAnalyzerGUI(QMainWindow):
                         if len(parts) >= 3:
                             name = parts[2]
                             
-                        self.add_peak_to_fitter(center, (center-0.5, center+0.5), peak_type, name)
-                        count += 1
+                        peaks_to_add.append(
+                            (center, (center - 0.5, center + 0.5), peak_type, name)
+                        )
                     except ValueError:
                         continue
-                        
+
+            if peaks_to_add:
+                if self.fitter is None:
+                    self.fitter = Fitter(self.x_data, self.y_data)
+                for center, bounds, peak_type, name in peaks_to_add:
+                    self.fitter.add_peak(center, bounds, peak_type, name)
+                self.refresh_after_peak_change()
+
+            count = len(peaks_to_add)
             msg = f"成功导入 {count} 个峰"
             if skipped > 0:
                 msg += f" (已忽略 {skipped} 个超出范围的峰)"
@@ -2079,6 +2185,80 @@ class XRDAnalyzerGUI(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"错误: {str(e)}")
+
+    def export_fitted_peaks_to_file(self) -> None:
+        """将当前有效拟合结果的峰位导出为可再次导入的TXT峰列表。"""
+        if self.fitter is None or self.fitter.result is None:
+            QMessageBox.warning(self, "没有拟合结果", "请先完成一次拟合")
+            return
+
+        fitted_peaks = [
+            peak
+            for peak in self.fitter.peaks
+            if peak.fit_state != "disabled" and peak.center is not None
+        ]
+        if not fitted_peaks:
+            QMessageBox.warning(self, "没有可导出的峰", "当前拟合结果中没有有效峰位")
+            return
+
+        default_stem = (
+            f"{Path(str(self.current_file)).stem}_peaks"
+            if self.current_file
+            else "fitted_peak_positions"
+        )
+        default_path = self.peak_library_directory() / f"{default_stem}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出拟合峰位置",
+            str(default_path),
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path).with_suffix(".txt")
+        lines = [
+            "# XRD Analyzer fitted peak positions",
+            "# 2theta_deg - type - name",
+        ]
+        for peak in fitted_peaks:
+            safe_name = " ".join(str(peak.name).splitlines()).strip()
+            lines.append(
+                f"{float(peak.center):.6f} - {peak.peak_type} - {safe_name}"
+            )
+
+        try:
+            output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.statusBar().showMessage(f"已导出 {len(fitted_peaks)} 个拟合峰位: {output_path.name}")
+
+    def apply_peak_shift(self, delta_2theta_deg: float) -> None:
+        """整体平移全部峰位；单位为degree 2theta。"""
+        if self.fitter is None or not self.fitter.peaks:
+            QMessageBox.warning(self, "没有峰", "请先导入或添加峰")
+            return
+        try:
+            shifted_count = self.fitter.shift_peaks(delta_2theta_deg)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法平移峰位", str(exc))
+            return
+        if shifted_count == 0:
+            return
+        self.refresh_after_peak_change()
+        direction = "右" if delta_2theta_deg > 0 else "左"
+        self.statusBar().showMessage(
+            f"{shifted_count} 个峰已向{direction}平移 "
+            f"{abs(delta_2theta_deg):.6f}° (2θ)"
+        )
+
+    def apply_peak_shift_from_slider(self) -> None:
+        """应用回中式滑块选择的峰位整体平移量。"""
+        slider_steps = self.peak_shift_slider.value()
+        self.peak_shift_slider.setValue(0)
+        if slider_steps:
+            self.apply_peak_shift(slider_steps * self.peak_shift_step.value())
 
     def delete_selected_peak(self):
         """删除选中的峰"""
@@ -2100,14 +2280,14 @@ class XRDAnalyzerGUI(QMainWindow):
         for row in selected_rows:
             peak_id = int(self.peak_table.item(row, 0).text())
             peak_ids_to_delete.append(peak_id)
-        
+
         self.fitter.remove_peaks(peak_ids_to_delete)
         self.refresh_after_peak_change()
         self.statusBar().showMessage("峰已删除，请重新拟合")
     
     def clear_all_peaks(self):
         """清除所有峰"""
-        if self.fitter is not None:
+        if self.fitter is not None and self.fitter.peaks:
             self.fitter.clear_peaks()
             self.refresh_after_peak_change()
     
@@ -2239,12 +2419,9 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 更新峰列表表格
         self.update_peak_table()
-        
-        # 显示结果
-        self.display_results()
-        
-        # 计算物理参数
-        self.display_physics_parameters()
+
+        # 只有完成优化并产生新结果时，才写入撤销/恢复历史。
+        self.record_completed_fit()
         
         diagnostics = self.fitter.fit_diagnostics
         boundary_hits = diagnostics.get('boundary_hits', [])
@@ -2313,8 +2490,8 @@ class XRDAnalyzerGUI(QMainWindow):
             )
         
         # 拟合曲线
-        ax.plot(self.fitter.x_data, self.fitter.y_fit, 
-               'r-', linewidth=2.5, label='Fit', zorder=3)
+        ax.plot(self.fitter.x_data, self.fitter.y_fit,
+               'r-', linewidth=2.5, label='Total', zorder=3)
         
         # 各个峰的分量
         peak_curves = self.fitter.get_individual_peaks()
@@ -2322,7 +2499,7 @@ class XRDAnalyzerGUI(QMainWindow):
         
         for i, (peak_id, curve) in enumerate(peak_curves.items()):
             peak = self.fitter.peaks[peak_id]
-            label = f'Peak {peak_id} ({peak.peak_type})\n2θ={peak.center:.3f}°'
+            label = peak.name.strip() if peak.name else 'Unnamed peak'
             ax.plot(self.fitter.x_data, curve, 
                    '--', color=colors[i], linewidth=2, 
                    alpha=0.7, label=label, zorder=2)
@@ -2385,123 +2562,6 @@ class XRDAnalyzerGUI(QMainWindow):
                fontsize=11, fontweight='bold')
         
         self.plot_canvas.draw()
-    
-    def display_results(self):
-        """显示拟合结果"""
-        if self.reporter is None:
-            return
-        
-        text = "=" * 60 + "\n"
-        text += "拟合结果详情\n"
-        text += "=" * 60 + "\n\n"
-
-        diagnostics = self.fitter.fit_diagnostics
-        if diagnostics:
-            text += "【求解状态与本轮配置】\n"
-            text += "-" * 40 + "\n"
-            text += f"Success                  : {diagnostics.get('success')}\n"
-            text += f"Message                  : {diagnostics.get('message')}\n"
-            text += f"Function evaluations     : {diagnostics.get('nfev')}\n"
-            text += (
-                "Covariance available      : "
-                f"{diagnostics.get('covariance_available')}\n"
-            )
-            text += f"Method                   : {diagnostics.get('method')}\n"
-            text += f"Objective                : {diagnostics.get('objective_mode')}\n"
-            text += f"Log weight               : {diagnostics.get('log_weight')}\n"
-            text += f"Log intensity floor I0   : {diagnostics.get('intensity_floor')}\n"
-            text += f"Fit points               : {diagnostics.get('fit_point_count')}\n"
-            hits = diagnostics.get('boundary_hits', [])
-            text += f"Boundary hits            : {', '.join(hits) if hits else 'None'}\n\n"
-            fit_warnings = diagnostics.get('warnings', [])
-            text += f"Warnings                 : {' | '.join(fit_warnings) if fit_warnings else 'None'}\n\n"
-        
-        # 评估指标
-        text += "【拟合质量评估】\n"
-        text += "-" * 40 + "\n"
-        for key, value in self.reporter.metrics.items():
-            if isinstance(value, (int, float, np.number)):
-                text += f"{key:25s}: {value:.6e}\n"
-            else:
-                text += f"{key:25s}: {value}\n"
-        text += "\n"
-        
-        # 各峰参数
-        text += "【峰参数】\n"
-        text += "-" * 40 + "\n"
-        for peak in self.fitter.peaks:
-            text += f"\nPeak {peak.peak_id} ({peak.peak_type}):\n"
-            text += f"  中心位置 (2θ)    : {peak.center:.4f}°\n"
-            text += f"  峰高 (Intensity) : {peak.height:.2f}\n"
-            text += f"  FWHM             : {peak.fwhm:.4f}°\n"
-            text += f"  峰面积           : {peak.area:.2f}\n"
-            text += f"  η (P-V混合比)    : {peak.eta:.4f}\n"
-        
-        # lmfit报告
-        text += "\n" + "=" * 60 + "\n"
-        text += "【Lmfit拟合报告】\n"
-        text += "=" * 60 + "\n"
-        text += self.fitter.get_fit_report()
-        
-        self.results_text.setPlainText(text)
-    
-    def display_physics_parameters(self):
-        """显示物理参数"""
-        if self.reporter is None:
-            return
-        
-        text = "=" * 60 + "\n"
-        text += "物理参数计算\n"
-        text += "=" * 60 + "\n\n"
-        
-        characteristic_lengths = self.reporter.calculate_characteristic_lengths()
-        wavelength = self.reporter.wavelength_angstrom
-        radiation_label = self.reporter.radiation_label
-        
-        text += (
-            "【反射峰特征长度 d】"
-            f"(λ = {wavelength:.6f} Å, {radiation_label})\n"
-        )
-        text += "-" * 40 + "\n"
-        text += "说明：该值是对应反射峰的Bragg d间距，不等同于晶格常数。\n"
-        text += "程序不根据002、004、111、200等峰名自动推断晶格倍数。\n"
-
-        for value in characteristic_lengths.values():
-            reflection_label = value['reflection_label'] or '未指定'
-            text += f"\nPeak {value['peak_id']} ({reflection_label}):\n"
-            text += f"  峰位 2θ             : {value['2theta_deg']:.6f}°\n"
-            text += (
-                "  特征长度 d           : "
-                f"{value['characteristic_length_angstrom']:.6f} Å\n"
-            )
-        
-        # 未校正仪器展宽时，只报告表观Scherrer相干畴尺寸。
-        text += "\n【表观Scherrer相干畴尺寸估算】\n"
-        text += "-" * 40 + "\n"
-        text += "D = Kλ / (β·cosθ)\n"
-        text += "K = 0.9；β为拟合FWHM，未作仪器展宽修正\n\n"
-        
-        for peak in self.fitter.peaks:
-            if peak.fwhm is not None and peak.center is not None:
-                D_nm = BraggGeometry.apparent_scherrer_size_nm(
-                    peak.center,
-                    peak.fwhm,
-                    wavelength,
-                    shape_factor=0.9,
-                )
-                
-                text += f"Peak {peak.peak_id} ({peak.peak_type}):\n"
-                text += f"  表观相干畴尺寸: {D_nm:.2f} nm\n"
-        
-        # 应力/应变分析
-        text += "\n【应力分析提示】\n"
-        text += "-" * 40 + "\n"
-        text += "• 特征长度只表示当前反射的d间距，不直接代表晶格常数\n"
-        text += "• 晶相或应变判断需要明确的(hkl)指认和独立参考峰位\n"
-        text += "• 峰展宽 → 晶粒尺寸减小或微观应变增大\n"
-        text += "• 建议结合sin²ψ方法进行残余应力定量分析\n"
-        
-        self.physics_text.setPlainText(text)
     
     def export_excel(self):
         """导出Excel报告"""

@@ -13,6 +13,7 @@ import numpy as np
 
 from xrd_analyzer import (
     Fitter,
+    FitterHistory,
     PROJECT_WORKBOOK_SCHEMA_VERSION,
     Reporter,
     pseudo_voigt,
@@ -168,6 +169,7 @@ __all__ = [
     "DataLoader",
     "FitConfiguration",
     "Fitter",
+    "FitterHistory",
     "Peak",
     "PreprocessingStep",
     "Preprocessor",

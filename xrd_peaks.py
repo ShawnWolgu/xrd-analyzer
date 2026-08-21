@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -86,3 +87,73 @@ class Peak:
         area = np.trapz(y_data[mask], x_data[mask])
         self.area = area
         return area
+
+
+@dataclass(frozen=True)
+class PeakSnapshot:
+    """Immutable copy of all user-visible configuration and result fields of one peak."""
+
+    peak_id: int
+    center_guess: float
+    bounds: Tuple[float, float]
+    peak_type: str
+    name: str
+    sigma_guess: Optional[float]
+    height_guess: Optional[float]
+    area_guess: Optional[float]
+    fraction_guess: Optional[float]
+    fit_state: str
+    center: Optional[float]
+    height: Optional[float]
+    fwhm: Optional[float]
+    area: Optional[float]
+    eta: Optional[float]
+    fixed_center: bool
+    fixed_height: bool
+    fixed_fwhm: bool
+
+    @classmethod
+    def from_peak(cls, peak: Peak) -> "PeakSnapshot":
+        return cls(
+            peak_id=peak.peak_id,
+            center_guess=peak.center_guess,
+            bounds=tuple(peak.bounds),
+            peak_type=peak.peak_type,
+            name=peak.name,
+            sigma_guess=peak.sigma_guess,
+            height_guess=peak.height_guess,
+            area_guess=peak.area_guess,
+            fraction_guess=peak.fraction_guess,
+            fit_state=peak.fit_state,
+            center=peak.center,
+            height=peak.height,
+            fwhm=peak.fwhm,
+            area=peak.area,
+            eta=peak.eta,
+            fixed_center=peak.fixed_center,
+            fixed_height=peak.fixed_height,
+            fixed_fwhm=peak.fixed_fwhm,
+        )
+
+    def to_peak(self) -> Peak:
+        peak = Peak(
+            self.peak_id,
+            self.center_guess,
+            self.bounds,
+            self.peak_type,
+            self.name,
+        )
+        peak.sigma_guess = self.sigma_guess
+        peak.height_guess = self.height_guess
+        peak.area_guess = self.area_guess
+        peak.fraction_guess = self.fraction_guess
+        peak.fit_state = self.fit_state
+        peak.center = self.center
+        peak.height = self.height
+        peak.fwhm = self.fwhm
+        peak.area = self.area
+        peak.eta = self.eta
+        peak.fixed_center = self.fixed_center
+        peak.fixed_height = self.fixed_height
+        peak.fixed_fwhm = self.fixed_fwhm
+        return peak
