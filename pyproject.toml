@@ -39,6 +39,7 @@ py-modules = [
   "main",
   "plot_style",
   "plot_from_excel",
+  "ui_i18n",
   "xrd_backend",
   "xrd_crystallography",
   "xrd_analyzer",

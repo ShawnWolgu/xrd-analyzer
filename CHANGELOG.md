@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.0 — 2026-08-21
+
+- Added live Chinese, Japanese, and English UI switching from the upper-right language selector.
+- Persisted the selected UI language in restorable Excel project state.
+- Standardized built-in plot titles, axes, callouts, and legend labels in English.
+
 ## v1.0.0 — 2026-08-21
 
 - Established a general-purpose XRD Analyzer identity and standard `main.py` entry point.

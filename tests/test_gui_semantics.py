@@ -4,13 +4,25 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import lmfit
 import numpy as np
 import matplotlib
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton
+from PyQt5.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QComboBox,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QTableWidget,
+    QWidget,
+)
 import pytest
 
 from xrd_analyzer import (
@@ -19,26 +31,102 @@ from xrd_analyzer import (
     PROJECT_WORKBOOK_SCHEMA_VERSION,
     Reporter,
 )
-from xrd_gui import FittingThread, XRDAnalyzerGUI
+from xrd_gui import FittingThread, PeakConfigDialog, XRDAnalyzerGUI
 from xrd_session import AnalysisSession, PreprocessingStep, ScanData
 from main import startup_banner_text
+from ui_i18n import translate
 
 
 def test_product_identity_is_general_xrd_analysis() -> None:
     banner = startup_banner_text()
-    assert "XRD Analyzer v1.0.0" in banner
+    assert "XRD Analyzer v1.1.0" in banner
     assert "通用 X 射线衍射分析工具" in banner
     assert "PZT" not in banner
     assert "薄膜专用" not in banner
 
     app = QApplication.instance() or QApplication([])
     window = XRDAnalyzerGUI()
-    assert window.windowTitle() == "XRD Analyzer v1.0.0 - 通用 X 射线衍射分析工具"
+    assert window.windowTitle() == "XRD Analyzer v1.1.0 - 通用 X 射线衍射分析工具"
     assert window.peak_type_combo.currentText() == "样品峰"
     assert window.peak_type_combo.currentData() == "film"
     assert window.constrain_fwhm_cb.text() == "强制样品峰FWHM相等"
     assert "PZT" not in window.peak_name_input.placeholderText()
     window.close()
+    app.processEvents()
+
+
+def test_language_switch_updates_main_ui_immediately() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+
+    window.set_ui_language("ja")
+    assert window.windowTitle() == "XRD Analyzer v1.1.0 - 汎用 X 線回折解析ツール"
+    assert window.file_group.title() == "1. データの読み込みと結合"
+    assert window.execute_fit_btn.text() == "フィッティングを実行"
+    assert window.analysis_tabs.tabText(0) == "データとフィッティング"
+    assert window.peak_table.horizontalHeaderItem(3).text() == "面積"
+    assert window.filter_combo.currentData() == "none"
+    message_box = QMessageBox()
+    message_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+    assert message_box.button(QMessageBox.Yes).text().startswith("はい")
+
+    window.set_ui_language("en")
+    assert window.windowTitle() == "XRD Analyzer v1.1.0 - General-purpose X-ray diffraction analysis tool"
+    assert window.file_group.title() == "1. Data Loading and Merging"
+    assert window.execute_fit_btn.text() == "Run Fit"
+    assert window.analysis_tabs.tabText(0) == "Data and Fitting"
+    assert window.peak_table.horizontalHeaderItem(3).text() == "Area"
+    assert window.filter_combo.currentData() == "none"
+    assert translate("没有数据", "en") == "No Data"
+    message_box = QMessageBox()
+    message_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+    assert "Yes" in message_box.button(QMessageBox.Yes).text()
+
+    window.close()
+    app.processEvents()
+
+
+def _visible_widget_strings(root: QWidget) -> list[str]:
+    strings: list[str] = []
+    language_combo = getattr(root, "language_combo", None)
+    for widget in [root, *root.findChildren(QWidget)]:
+        if isinstance(widget, QGroupBox):
+            strings.append(widget.title())
+        if isinstance(widget, (QLabel, QAbstractButton)):
+            strings.append(widget.text())
+        if isinstance(widget, QLineEdit):
+            strings.append(widget.placeholderText())
+        strings.append(widget.toolTip())
+        if isinstance(widget, QComboBox) and widget is not language_combo:
+            strings.extend(
+                widget.itemText(index) for index in range(widget.count())
+            )
+        if isinstance(widget, QTableWidget):
+            strings.extend(
+                widget.horizontalHeaderItem(index).text()
+                for index in range(widget.columnCount())
+                if widget.horizontalHeaderItem(index) is not None
+            )
+    return [text for text in strings if text]
+
+
+def test_english_ui_contains_no_untranslated_chinese_widget_text() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+    window.set_ui_language("ja")
+    window.set_ui_language("en")
+    dialog = PeakConfigDialog(language="en")
+
+    untranslated = [
+        text
+        for root in (window, dialog)
+        for text in _visible_widget_strings(root)
+        if re.search(r"[\u3400-\u9fff]", text)
+    ]
+
+    assert untranslated == []
+    window.close()
+    dialog.close()
     app.processEvents()
 
 
@@ -115,6 +203,7 @@ def test_theoretical_d_mode_rejects_peak_outside_loaded_range(monkeypatch) -> No
     )
     window.wavelength_spin.setValue(DEFAULT_WAVELENGTH_ANGSTROM)
     window.peak_value_input.setValue(DEFAULT_WAVELENGTH_ANGSTROM)
+    window.set_ui_language("en")
     warnings = []
     monkeypatch.setattr(
         "xrd_gui.QMessageBox.warning",
@@ -125,6 +214,8 @@ def test_theoretical_d_mode_rejects_peak_outside_loaded_range(monkeypatch) -> No
 
     assert len(window.fitter.peaks) == 0
     assert warnings
+    assert warnings[0][1] == "Peak Outside Data Range"
+    assert not re.search(r"[\u3400-\u9fff]", warnings[0][2])
 
     window.close()
     app.processEvents()
@@ -372,6 +463,14 @@ def test_live_fit_legend_uses_total_and_peak_names_only() -> None:
     assert "200" in labels
     assert not any("Peak 0" in label or "Peak 1" in label for label in labels)
     assert "Fit" not in labels
+
+    window.fitter.fit_mask[0] = False
+    window.fitter.fit_config["exclude_ranges"] = [(40.0, 40.1)]
+    window.plot_fitted_results()
+    labels = [text.get_text() for text in window.plot_canvas.axes.get_legend().texts]
+    assert "Fit data" in labels
+    assert "Excluded range" in labels
+    assert not any(re.search(r"[\u3400-\u9fff]", label) for label in labels)
 
     window.close()
     app.processEvents()
@@ -894,6 +993,7 @@ def test_project_state_records_session_provenance() -> None:
         (PreprocessingStep.gaussian(sigma=1.5),)
     )
     window._sync_legacy_data_views()
+    window.set_ui_language("ja")
 
     state = window.collect_project_state()
 
@@ -905,6 +1005,7 @@ def test_project_state_records_session_provenance() -> None:
     assert state["processed_scan_sha256"] == window.session.processed_scan.content_sha256
     assert state["raw_point_count"] == 3
     assert state["raw_valid_point_count"] == 2
+    assert state["ui_language"] == "ja"
 
     window.close()
     app.processEvents()

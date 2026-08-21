@@ -1,6 +1,6 @@
 # XRD Analyzer
 
-Current release: **v1.0.0**
+Current release: **v1.1.0**
 
 XRD Analyzer is a general-purpose Python desktop application for loading X-ray diffraction
 scans, preprocessing intensity data, fitting Pseudo-Voigt peaks, restoring analysis projects,
@@ -49,6 +49,10 @@ multipliers or tetragonality inference.
 - Export workbooks that can be loaded again as project files, restoring data, peak guesses,
   fitted values, locks, peak states, fit controls, and the displayed candidate result.
 - Export fitting figures.
+- Switch the complete application UI live among Chinese, Japanese, and English; the selected
+  language is retained in newly exported project workbooks.
+- Keep built-in figure titles, axes, metric callouts, and legend terms in English in every UI
+  language. User-defined peak names are preserved exactly as entered.
 - Display reflection-specific Bragg characteristic lengths and provisional Scherrer-related
   quantities in the GUI.
 
@@ -150,6 +154,7 @@ scientific ground truth.
 - `xrd_crystallography.py`: Bragg characteristic-length and apparent Scherrer calculations.
 - `xrd_project.py`: versioned Excel project loading and restored-result compatibility.
 - `plot_from_excel.py`: plotting and summaries from exported workbooks.
+- `ui_i18n.py`: centralized Chinese, Japanese, and English interface translations.
 - `tests/`: automated regression and scientific-contract tests.
 - `tests/baselines/`: versioned synthetic-reference and historical-regression specifications.
 - `docs/architecture.md`: current boundaries and incremental target structure.
