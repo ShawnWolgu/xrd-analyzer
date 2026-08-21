@@ -17,6 +17,7 @@ from xrd_analyzer import (
     Reporter,
 )
 from xrd_gui import FittingThread, XRDAnalyzerGUI
+from xrd_session import AnalysisSession, PreprocessingStep, ScanData
 
 
 def _window_with_two_peaks() -> tuple[QApplication, XRDAnalyzerGUI]:
@@ -583,6 +584,20 @@ def test_excel_project_load_restores_data_peaks_and_gui_controls(tmp_path) -> No
             "wavelength_angstrom": 1.2345,
             "radiation_label": "自定义波长",
             "peak_input_mode": "d_spacing",
+            "preprocessing_steps": [
+                {"operation": "gaussian", "parameters": {"sigma": 1.5}}
+            ],
+            "session_fit_configuration": {
+                "method": "least_squares",
+                "objective_mode": "linear",
+                "log_weight": 0.2,
+                "intensity_floor": 2.0,
+                "constrain_fwhm": True,
+                "min_peak_separation": 0.35,
+                "fixed_background": None,
+                "include_ranges": [[43.5, 44.5]],
+                "exclude_ranges": [],
+            },
         },
         source_datasets=[("original-scan.txt", x_data, y_data)],
     )
@@ -612,6 +627,69 @@ def test_excel_project_load_restores_data_peaks_and_gui_controls(tmp_path) -> No
     assert window.reporter.wavelength_angstrom == pytest.approx(1.2345)
     assert window.fitter.result is not None
     assert window.reporter is not None
+    assert [step.operation for step in window.session.preprocessing] == ["gaussian"]
+    assert window.session.fit_configuration.objective_mode == "linear"
+    assert window.session.fit_configuration.include_ranges == ((43.5, 44.5),)
+
+    window.close()
+    app.processEvents()
+
+
+def test_reapplying_same_preprocessing_is_idempotent_and_invalidates_old_fit() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+    x_data = np.linspace(40.0, 48.0, 81)
+    y_data = 5.0 + 100.0 * np.exp(-((x_data - 44.0) / 0.2) ** 2)
+    window.x_data = x_data.copy()
+    window.y_data = y_data.copy()
+    window.x_data_raw = x_data.copy()
+    window.y_data_raw = y_data.copy()
+    window.x_data_original = x_data.copy()
+    window.y_data_original = y_data.copy()
+    window.fitter = Fitter(window.x_data, window.y_data)
+    window.fitter.add_peak(44.0, (43.5, 44.5), "film", "002")
+    window.fitter.result = object()
+    window.reporter = object()
+    window.filter_combo.setCurrentText("高斯滤波")
+    window.bg_combo.setCurrentText("无")
+
+    window.apply_preprocessing()
+    first_result = window.y_data.copy()
+    window.apply_preprocessing()
+
+    np.testing.assert_array_equal(window.y_data, first_result)
+    np.testing.assert_array_equal(window.fitter.y_data, window.y_data)
+    assert len(window.fitter.peaks) == 1
+    assert window.fitter.result is None
+    assert window.reporter is None
+
+    window.close()
+    app.processEvents()
+
+
+def test_project_state_records_session_provenance() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = XRDAnalyzerGUI()
+    raw_scan = ScanData(
+        np.array([42.0, 43.0, 44.0]),
+        np.array([10.0, np.nan, 30.0]),
+        source_id="scan.txt",
+    )
+    window.session = AnalysisSession.from_raw(raw_scan).with_preprocessing(
+        (PreprocessingStep.gaussian(sigma=1.5),)
+    )
+    window._sync_legacy_data_views()
+
+    state = window.collect_project_state()
+
+    assert state["schema_version"] == PROJECT_WORKBOOK_SCHEMA_VERSION
+    assert state["preprocessing_steps"] == [
+        {"operation": "gaussian", "parameters": {"sigma": 1.5}}
+    ]
+    assert state["raw_scan_sha256"] == window.session.raw_scan.content_sha256
+    assert state["processed_scan_sha256"] == window.session.processed_scan.content_sha256
+    assert state["raw_point_count"] == 3
+    assert state["raw_valid_point_count"] == 2
 
     window.close()
     app.processEvents()

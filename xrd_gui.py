@@ -1,13 +1,12 @@
 # xrd_gui.py - PyQt5 GUI界面
 
-import sys
 import os
 import re
 from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTableWidget,
     QTableWidgetItem, QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox,
     QComboBox, QTextEdit, QSplitter, QTabWidget, QMessageBox,
@@ -26,10 +25,15 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from threadpoolctl import threadpool_limits
 
-from xrd_analyzer import (
+from xrd_backend import (
+    AnalysisSession,
     BraggGeometry, DEFAULT_RADIATION_LABEL, DEFAULT_WAVELENGTH_ANGSTROM,
-    DataLoader, Preprocessor, Fitter, PROJECT_WORKBOOK_SCHEMA_VERSION,
-    PSEUDO_VOIGT_FWHM_FACTOR, ProjectWorkbook, Reporter, RestoredFitResult, Peak
+    Fitter, PROJECT_WORKBOOK_SCHEMA_VERSION,
+    FitConfiguration,
+    PSEUDO_VOIGT_FWHM_FACTOR, Reporter, RestoredFitResult, Peak,
+    PreprocessingStep,
+    ScanData,
+    XRDApplicationService,
 )
 
 
@@ -271,6 +275,8 @@ class XRDAnalyzerGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
+
+        self.backend = XRDApplicationService()
         
         # 数据
         self.x_data = None
@@ -292,6 +298,65 @@ class XRDAnalyzerGUI(QMainWindow):
         self.fit_thread = None
         
         self.init_ui()
+
+    @property
+    def session(self) -> AnalysisSession:
+        """兼容旧控制器代码的 backend Session 只读入口。"""
+        return self.backend.session
+
+    @session.setter
+    def session(self, session: AnalysisSession) -> None:
+        self.backend.set_session(session)
+
+    def _sync_legacy_data_views(self) -> None:
+        """从 Session 同步过渡期 GUI 字段，Session 始终是数据状态源。"""
+        if not self.session.has_data:
+            self.x_data = None
+            self.y_data = None
+            self.x_data_raw = None
+            self.y_data_raw = None
+            self.x_data_original = None
+            self.y_data_original = None
+            self.active_data_range = None
+            return
+
+        self.x_data = self.session.processed_scan.two_theta
+        self.y_data = self.session.processed_scan.intensity
+        self.x_data_raw = self.session.raw_scan.two_theta
+        self.y_data_raw = self.session.raw_scan.intensity
+        self.x_data_original = self.session.raw_scan.two_theta
+        self.y_data_original = self.session.raw_scan.intensity
+        self.active_data_range = self.session.active_range
+
+    def _ensure_session_from_legacy_data(self) -> None:
+        """兼容测试和旧调用方直接设置数组的过渡路径。"""
+        if self.session.has_data or self.x_data_raw is None or self.y_data_raw is None:
+            return
+        source_id = str(self.current_file or "")
+        source_scans = tuple(
+            ScanData(source_x, source_y, source_id=str(path))
+            for path, source_x, source_y in self.loaded_files_data
+        )
+        self.backend.restore_session(
+            self.x_data_raw,
+            self.y_data_raw,
+            self.y_data if self.y_data is not None else self.y_data_raw,
+            source_id=source_id,
+            active_range=self.active_data_range,
+            project_id=source_id,
+            source_scans=source_scans,
+        )
+        self._sync_legacy_data_views()
+
+    def _invalidate_fit_for_data_change(self, preserve_peaks: bool = True) -> None:
+        """数据改变后重建 Fitter，并仅保留仍有效的峰配置。"""
+        old_peaks = list(self.fitter.peaks) if preserve_peaks and self.fitter else []
+        for peak in old_peaks:
+            peak.clear_result()
+        self.fitter = self.backend.create_fitter(old_peaks)
+        self.reporter = None
+        self.results_text.clear()
+        self.physics_text.clear()
         
     def init_ui(self):
         self.setWindowTitle("XRD数据分析系统 - PZT薄膜专用")
@@ -855,6 +920,30 @@ class XRDAnalyzerGUI(QMainWindow):
             'wavelength_angstrom': self.wavelength_spin.value(),
             'radiation_label': self.current_radiation_label(),
             'peak_input_mode': self.peak_input_mode.currentData(),
+            'preprocessing_steps': [
+                step.to_record() for step in self.session.preprocessing
+            ],
+            'session_fit_configuration': self.session.fit_configuration.to_record(),
+            'raw_scan_sha256': (
+                self.session.raw_scan.content_sha256
+                if self.session.raw_scan is not None
+                else None
+            ),
+            'processed_scan_sha256': (
+                self.session.processed_scan.content_sha256
+                if self.session.processed_scan is not None
+                else None
+            ),
+            'raw_point_count': (
+                int(self.session.raw_scan.two_theta.size)
+                if self.session.raw_scan is not None
+                else 0
+            ),
+            'raw_valid_point_count': (
+                int(np.count_nonzero(self.session.raw_scan.valid_mask))
+                if self.session.raw_scan is not None
+                else 0
+            ),
         }
 
     @staticmethod
@@ -935,7 +1024,7 @@ class XRDAnalyzerGUI(QMainWindow):
 
     def load_excel_project(self, file_path: str) -> None:
         """从Excel报告恢复数据、峰、候选拟合结果和GUI状态。"""
-        project = ProjectWorkbook.load(file_path)
+        project = self.backend.load_project(file_path)
         x_data = np.asarray(project['x_data'], dtype=float)
         processed = np.asarray(project['processed_intensity'], dtype=float)
         raw = np.asarray(project['raw_intensity'], dtype=float)
@@ -947,23 +1036,46 @@ class XRDAnalyzerGUI(QMainWindow):
         self.results_text.clear()
         self.physics_text.clear()
 
-        self.x_data = x_data.copy()
-        self.y_data = processed.copy()
-        self.x_data_raw = x_data.copy()
-        self.y_data_raw = raw.copy()
-        self.x_data_original = x_data.copy()
-        self.y_data_original = raw.copy()
         self.current_file = str(file_path)
         self.last_data_dir = str(Path(file_path).parent)
         range_min = float(state.get('range_min', np.min(x_data)))
         range_max = float(state.get('range_max', np.max(x_data)))
-        self.active_data_range = (range_min, range_max)
+        preprocessing_records = state.get('preprocessing_steps', [])
+        preprocessing_steps = tuple(
+            PreprocessingStep.from_record(record)
+            for record in preprocessing_records
+            if isinstance(record, dict)
+        )
+        source_datasets = project.get('source_datasets', [])
+        source_scans = tuple(
+            ScanData(source_x, source_y, source_id=str(path))
+            for path, source_x, source_y in source_datasets
+        )
+        if not source_scans:
+            source_scans = (ScanData(x_data, raw, source_id=str(file_path)),)
+        stored_fit_configuration = state.get('session_fit_configuration')
+        fit_configuration = (
+            FitConfiguration.from_record(stored_fit_configuration)
+            if isinstance(stored_fit_configuration, dict)
+            else None
+        )
+        self.backend.restore_session(
+            x_data,
+            raw,
+            processed,
+            source_id=str(file_path),
+            active_range=(range_min, range_max),
+            project_id=str(file_path),
+            preprocessing=preprocessing_steps,
+            source_scans=source_scans,
+            fit_configuration=fit_configuration,
+        )
+        self._sync_legacy_data_views()
         self.range_min.setValue(range_min)
         self.range_max.setValue(range_max)
-        source_datasets = project.get('source_datasets', [])
         self.loaded_files_data = [
-            (str(path), np.asarray(source_x), np.asarray(source_y))
-            for path, source_x, source_y in source_datasets
+            (scan.source_id, scan.two_theta, scan.intensity)
+            for scan in self.session.source_scans
         ]
         source_paths = project.get('source_files', [])
         if self.loaded_files_data:
@@ -972,7 +1084,6 @@ class XRDAnalyzerGUI(QMainWindow):
                 item.setToolTip(path)
                 self.file_list_widget.addItem(item)
         else:
-            self.loaded_files_data = [(str(file_path), x_data.copy(), raw.copy())]
             project_item = QListWidgetItem(f"项目: {Path(file_path).name}")
             project_item.setToolTip(
                 "\n".join(source_paths) if source_paths else str(file_path)
@@ -1143,17 +1254,13 @@ class XRDAnalyzerGUI(QMainWindow):
                 if any(f[0] == file_path for f in self.loaded_files_data):
                     continue
                     
-                x, y = DataLoader.load_txt(file_path)
-                if self.active_data_range is not None:
-                    x, y = DataLoader.trim_range(
-                        x,
-                        y,
-                        self.active_data_range[0],
-                        self.active_data_range[1],
-                    )
-                    if len(x) == 0:
-                        continue
-                self.loaded_files_data.append((file_path, x, y))
+                source_scan = self.backend.load_source(
+                    file_path,
+                    self.active_data_range,
+                )
+                self.loaded_files_data.append(
+                    (file_path, source_scan.two_theta, source_scan.intensity)
+                )
                 
                 # 添加到列表UI
                 item = QListWidgetItem(Path(file_path).name)
@@ -1189,16 +1296,11 @@ class XRDAnalyzerGUI(QMainWindow):
         """清空文件"""
         self.loaded_files_data.clear()
         self.file_list_widget.clear()
-        self.x_data = None
-        self.y_data = None
-        self.x_data_raw = None
-        self.y_data_raw = None
-        self.x_data_original = None
-        self.y_data_original = None
+        self.backend.clear()
+        self._sync_legacy_data_views()
         self.plot_canvas.clear_axes()
         self.plot_canvas.draw()
         self.current_file = None
-        self.active_data_range = None
         
         # 同时也应该清除fitter，因为数据没了
         self.fitter = None
@@ -1274,24 +1376,7 @@ class XRDAnalyzerGUI(QMainWindow):
             self.clear_files()
             return
             
-        # 提取所有数据进行拼接
-        datasets = [(d[1], d[2]) for d in self.loaded_files_data]
-        
         try:
-            x_merged, y_merged = DataLoader.stitch_datasets(datasets)
-            if self.active_data_range is not None:
-                x_merged, y_merged = DataLoader.trim_range(
-                    x_merged,
-                    y_merged,
-                    self.active_data_range[0],
-                    self.active_data_range[1],
-                )
-            
-            self.x_data_raw = x_merged
-            self.y_data_raw = y_merged
-            self.x_data_original = x_merged.copy()
-            self.y_data_original = y_merged.copy()
-            
             # 更新当前文件名为第一个文件 + 标识
             first_file = Path(self.loaded_files_data[0][0]).stem
             if len(self.loaded_files_data) > 1:
@@ -1299,8 +1384,13 @@ class XRDAnalyzerGUI(QMainWindow):
             else:
                 self.current_file = self.loaded_files_data[0][0]
                 
-            self.x_data = x_merged.copy()
-            self.y_data = y_merged.copy()
+            self.backend.merge_sources(
+                self.loaded_files_data,
+                active_range=self.active_data_range,
+                project_id=str(self.current_file),
+            )
+            self._sync_legacy_data_views()
+            x_merged = self.session.raw_scan.two_theta
 
             # 数据源改变后，旧峰和拟合结果不再对应当前数据。
             self.fitter = None
@@ -1355,10 +1445,34 @@ class XRDAnalyzerGUI(QMainWindow):
             ranges.append(tuple(sorted((lower, upper))))
         return ranges
 
+    def current_fit_configuration(self) -> FitConfiguration:
+        """将当前 GUI 控件转换为经过验证的核心拟合配置。"""
+        include_ranges = tuple(
+            self.parse_fit_ranges(self.include_ranges_input.text())
+        )
+        exclude_ranges = tuple(
+            self.parse_fit_ranges(self.exclude_ranges_input.text())
+        )
+        fixed_background = (
+            self.bg_spin.value() if self.bg_fix_cb.isChecked() else None
+        )
+        return FitConfiguration(
+            method=self.fit_method_combo.currentText(),
+            objective_mode=self.objective_combo.currentData(),
+            log_weight=self.log_spin.value() / 100.0,
+            intensity_floor=self.log_floor_spin.value(),
+            constrain_fwhm=self.constrain_fwhm_cb.isChecked(),
+            min_peak_separation=self.min_separation.value(),
+            fixed_background=fixed_background,
+            include_ranges=include_ranges,
+            exclude_ranges=exclude_ranges,
+        )
+
 
     
     def apply_range(self):
         """提交数据加载范围，并永久裁剪当前项目中的全部数据。"""
+        self._ensure_session_from_legacy_data()
         if self.x_data_raw is None:
             return
         
@@ -1368,52 +1482,27 @@ class XRDAnalyzerGUI(QMainWindow):
             QMessageBox.warning(self, "范围错误", "2θ范围下限必须小于上限")
             return
 
-        trimmed_raw_x, trimmed_raw_y = DataLoader.trim_range(
-            self.x_data_raw,
-            self.y_data_raw,
-            x_min,
-            x_max,
-        )
-        if len(trimmed_raw_x) == 0:
+        try:
+            cropped_session = self.backend.crop(x_min, x_max)
+        except ValueError:
             QMessageBox.warning(self, "范围错误", "所选2θ范围内没有数据")
             return
 
         old_peaks = list(self.fitter.peaks) if self.fitter is not None else []
 
-        self.x_data_raw = trimmed_raw_x.copy()
-        self.y_data_raw = trimmed_raw_y.copy()
-        self.x_data, self.y_data = DataLoader.trim_range(
-            self.x_data,
-            self.y_data,
-            x_min,
-            x_max,
-        )
-        if self.x_data_original is not None and self.y_data_original is not None:
-            self.x_data_original, self.y_data_original = DataLoader.trim_range(
-                self.x_data_original,
-                self.y_data_original,
-                x_min,
-                x_max,
-            )
+        self.session = cropped_session
+        self._sync_legacy_data_views()
 
-        filtered_sources = []
-        for path, source_x, source_y in self.loaded_files_data:
-            source_x, source_y = DataLoader.trim_range(
-                source_x,
-                source_y,
-                x_min,
-                x_max,
-            )
-            if len(source_x) > 0:
-                filtered_sources.append((path, source_x, source_y))
-        self.loaded_files_data = filtered_sources
+        self.loaded_files_data = [
+            (scan.source_id, scan.two_theta, scan.intensity)
+            for scan in self.session.source_scans
+        ]
         self.file_list_widget.clear()
         for path, _, _ in self.loaded_files_data:
             item = QListWidgetItem(Path(path).name)
             item.setToolTip(path)
             self.file_list_widget.addItem(item)
 
-        self.active_data_range = (x_min, x_max)
         self.reporter = None
         self.results_text.clear()
         self.physics_text.clear()
@@ -1448,44 +1537,51 @@ class XRDAnalyzerGUI(QMainWindow):
         self.statusBar().showMessage(message)
     
     def apply_preprocessing(self):
-        """应用预处理"""
-        if self.y_data is None:
+        """从不可变原始扫描重新执行当前预处理配置。"""
+        self._ensure_session_from_legacy_data()
+        if not self.session.has_data:
             return
-        
-        y_processed = self.y_data.copy()
-        
+
+        steps = []
         # 滤波
         filter_type = self.filter_combo.currentText()
         if filter_type == 'Savitzky-Golay':
             window = self.sg_window.value()
             if window % 2 == 0:
                 window += 1
-            y_processed = Preprocessor.apply_savgol_filter(y_processed, window, 3)
+            steps.append(PreprocessingStep.savgol(window, 3))
         elif filter_type == '高斯滤波':
-            y_processed = Preprocessor.apply_gaussian_filter(y_processed, sigma=1.5)
+            steps.append(PreprocessingStep.gaussian(sigma=1.5))
         elif filter_type == 'FFT滤波':
-            y_processed = Preprocessor.apply_fft_filter(y_processed, cutoff_freq=0.1)
-        
+            steps.append(PreprocessingStep.fft(cutoff_freq=0.1))
+
         # 背景扣除
         bg_type = self.bg_combo.currentText()
         if bg_type == '多项式':
-            degree = self.poly_degree.value()
-            y_processed, bg = Preprocessor.subtract_background_polynomial(
-                self.x_data, y_processed, degree
+            steps.append(
+                PreprocessingStep.polynomial_background(self.poly_degree.value())
             )
         elif bg_type == 'SNIP':
-            y_processed, bg = Preprocessor.subtract_background_snip(y_processed, iterations=40)
-        
-        self.y_data = y_processed
+            steps.append(PreprocessingStep.snip_background(iterations=40))
+
+        self.backend.apply_preprocessing(steps)
+        self._sync_legacy_data_views()
+        self._invalidate_fit_for_data_change(preserve_peaks=True)
         self.plot_canvas.set_data(self.x_data, self.y_data)
+        self.update_peak_table()
+        self.redraw_peak_guesses()
         self.statusBar().showMessage('预处理完成')
     
     def reset_to_raw(self):
         """重置为原始数据"""
-        if self.x_data_raw is not None:
-            self.x_data = self.x_data_raw.copy()
-            self.y_data = self.y_data_raw.copy()
+        self._ensure_session_from_legacy_data()
+        if self.session.has_data:
+            self.backend.reset_preprocessing()
+            self._sync_legacy_data_views()
+            self._invalidate_fit_for_data_change(preserve_peaks=True)
             self.plot_canvas.set_data(self.x_data, self.y_data)
+            self.update_peak_table()
+            self.redraw_peak_guesses()
             self.statusBar().showMessage('已重置为原始数据')
 
     
@@ -2084,32 +2180,29 @@ class XRDAnalyzerGUI(QMainWindow):
         self.sync_table_to_peaks()
         
         try:
-            include_ranges = self.parse_fit_ranges(self.include_ranges_input.text())
-            exclude_ranges = self.parse_fit_ranges(self.exclude_ranges_input.text())
+            fit_configuration = self.current_fit_configuration()
         except ValueError as exc:
             QMessageBox.warning(self, "拟合区间格式错误", str(exc))
             return
+
+        self.backend.set_fit_configuration(fit_configuration)
 
         # 显示进度条
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
         # 创建拟合线程
-        log_weight = self.log_spin.value() / 100.0
-        
-        fixed_bg = self.bg_spin.value() if self.bg_fix_cb.isChecked() else None
-        
         self.fit_thread = FittingThread(
             self.fitter,
-            self.constrain_fwhm_cb.isChecked(),
-            self.min_separation.value(),
-            method=self.fit_method_combo.currentText(),
-            objective_mode=self.objective_combo.currentData(),
-            log_weight=log_weight,
-            intensity_floor=self.log_floor_spin.value(),
-            include_ranges=include_ranges,
-            exclude_ranges=exclude_ranges,
-            fixed_background=fixed_bg
+            fit_configuration.constrain_fwhm,
+            fit_configuration.min_peak_separation,
+            method=fit_configuration.method,
+            objective_mode=fit_configuration.objective_mode,
+            log_weight=fit_configuration.log_weight,
+            intensity_floor=fit_configuration.intensity_floor,
+            include_ranges=list(fit_configuration.include_ranges),
+            exclude_ranges=list(fit_configuration.exclude_ranges),
+            fixed_background=fit_configuration.fixed_background,
         )
         
         self.fit_thread.progress.connect(self.progress_bar.setValue)
@@ -2473,25 +2566,3 @@ class XRDAnalyzerGUI(QMainWindow):
                 QMessageBox.information(self, "成功", f"图片已保存至:\n{file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败:\n{str(e)}")
-
-
-def main():
-    """主函数"""
-    app = QApplication(sys.argv)
-    
-    # 设置应用样式
-    app.setStyle('Fusion')
-    
-    # 设置全局字体
-    font = QFont("Microsoft YaHei", 10)
-    app.setFont(font)
-    
-    # 创建主窗口
-    window = XRDAnalyzerGUI()
-    window.show()
-    
-    sys.exit(app.exec_())
-
-
-if __name__ == '__main__':
-    main()

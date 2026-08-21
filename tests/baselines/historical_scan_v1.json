@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "evidence_level": "REGRESSION-ONLY",
+  "source_file": "230610_sgPZT(30_70)_004.TXT",
+  "file_sha256": "066937131cafda1700b8b88f6b5a708900346032bb26ce26a1b243c8adbaaad2",
+  "scan_content_sha256": "596429424cb40598612c3205e42decf28259dafd30dc79a81b81fec26a30e309",
+  "points": 1001,
+  "x_first": 90.0,
+  "x_last": 110.0,
+  "x_step_median": 0.01999999999999602,
+  "intensity_min": 0.0,
+  "intensity_max": 29258.3,
+  "intensity_sum": 1388858.0991200001,
+  "preprocessing": {
+    "operation": "savgol",
+    "window_length": 11,
+    "polyorder": 3,
+    "intensity_sum": 1388862.7028497593,
+    "intensity_max": 28991.298834498913,
+    "argmax_two_theta": 104.06
+  },
+  "numeric_tolerances": {
+    "relative": 1e-12,
+    "absolute": 1e-8
+  }
+}

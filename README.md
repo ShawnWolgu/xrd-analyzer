@@ -19,6 +19,10 @@ multipliers or tetragonality inference.
 - Apply the data-loading 2theta range as a permanent project-wide crop; out-of-range data and
   peaks are removed from the live plot, fitting input, workbook export, and figure export.
 - Trim, smooth, and subtract polynomial or SNIP backgrounds.
+- Recompute preprocessing from an immutable raw scan and an explicit ordered operation list;
+  applying the same controls twice no longer compounds filtering.
+- Enforce a one-way frontend/backend dependency boundary: the PyQt frontend imports XRD
+  behavior only through `xrd_backend.py`, while the backend dependency closure contains no PyQt.
 - Add peaks manually or through automatic peak detection.
 - Add a numerical peak either from its `2theta` position or by converting a theoretical
   interplanar spacing `d` with the first-order Bragg relation.
@@ -57,10 +61,11 @@ metadata and development dependencies are defined in `pyproject.toml`.
 ## Run
 
 ```bash
-python run_analyzer.py
+python main.py
 ```
 
 After editable installation, the `xrd-analyzer` command is also available.
+The historical `python run_analyzer.py` command remains as a compatibility wrapper.
 
 The fitting workflow is intentionally user-controlled:
 
@@ -106,22 +111,47 @@ python -m pytest
 python -m ruff check .
 ```
 
+Run the versioned core baseline gate separately with:
+
+```bash
+python -m pytest -m baseline
+```
+
+See [Core baseline testing](docs/baseline-testing.md) for evidence levels and baseline-update
+rules.
+
+The scientific fitting pipeline, Pseudo-Voigt equations, parameter definitions, objectives,
+and result-interpretation boundaries are summarized in
+[XRD fitting model](docs/fitting-model.md).
+
 The suite contains regression tests for corrected legacy scientific issues. A passing suite
 only verifies the documented contracts; it does not turn historical example data into certified
 scientific ground truth.
 
 ## Repository map
 
-- `xrd_analyzer.py`: legacy core loading, preprocessing, fitting, metrics, and reporting.
+- `xrd_analyzer.py`: compatibility facade plus the remaining fitting and reporting engine.
+- `main.py`: the single application entry point and GUI startup orchestration.
 - `xrd_gui.py`: legacy PyQt5 interface and application state.
+- `xrd_backend.py`: the only public backend entrypoint used by the frontend, including
+  `XRDApplicationService`.
+- `xrd_session.py`: immutable scans, source scans, preprocessing provenance, and fit configuration.
+- `xrd_io.py`: two-column scan loading, cropping, and multi-scan stitching.
+- `xrd_preprocessing.py`: pure filtering and background transformations.
+- `xrd_peaks.py`: peak guesses, locks, states, and fitted parameter semantics.
+- `xrd_crystallography.py`: Bragg characteristic-length and apparent Scherrer calculations.
+- `xrd_project.py`: versioned Excel project loading and restored-result compatibility.
 - `plot_from_excel.py`: plotting and summaries from exported workbooks.
 - `tests/`: automated regression and scientific-contract tests.
+- `tests/baselines/`: versioned synthetic-reference and historical-regression specifications.
 - `docs/architecture.md`: current boundaries and incremental target structure.
+- `docs/fitting-model.md`: scientific fitting pipeline, equations, variables, and interpretation.
 - `docs/scientific-validation.md`: evidence status and scientific correction backlog.
 - `.agents/skills/xrd-scientific-maintenance/`: repository-specific Codex workflow.
 
-The planned package extraction is intentionally incremental. It will preserve a compatibility
-surface while moving formulas and state out of GUI callbacks.
+The package extraction is incremental. Existing imports remain compatible while state and
+scientific operations move out of GUI callbacks. Workbook schema version 3 records ordered
+preprocessing steps, structured fit configuration, scan hashes, and retained-point counts.
 
 ## Data and generated artifacts
 

@@ -3,6 +3,16 @@
 This record separates confirmed implementation behavior from validated scientific behavior.
 The migrated workbook and images are `REGRESSION-ONLY`; they are not ground truth.
 
+The release baseline has two explicit evidence layers:
+
+- `core_synthetic_v1.json`: `VERIFIED` synthetic recovery against an independent normalized
+  Pseudo-Voigt implementation and known injected parameters;
+- `historical_scan_v1.json`: `REGRESSION-ONLY` integrity and preprocessing stability for the
+  tracked historical scan.
+
+Baseline scope and update rules are defined in
+[`baseline-testing.md`](baseline-testing.md).
+
 ## Evidence labels
 
 - `VERIFIED`: checked against an analytical, independent, certified, or otherwise justified
@@ -22,7 +32,7 @@ The migrated workbook and images are `REGRESSION-ONLY`; they are not ground trut
 | Scan gaps | Stitching retains uncovered grid points as `NaN`; preprocessing operates independently on each continuous measured segment; fitting excludes non-finite observations | Missing ranges remain visible without becoming artificial observations or contaminating measured segments | Resolved with gap-preservation, preprocessing, fit-mask, and export tests |
 | Minimum separation | Adjacent optimized centers are related through a fitted gap parameter whose lower bound is the requested separation | The constraint follows movement of the preceding fitted center | Resolved with an analytical parameter-constraint test |
 | Mixed objective metrics | Linear, Log, and Mixed objectives are explicit; Log uses `log10(I + I0)` with a visible positive `I0`; the displayed `R²_fit` is computed only on the fit mask in linear intensity space; generic RMSE/reduced chi-square/AIC/BIC labels are not reported | Prevents excluded regions and incompatible residual scales from being folded into one headline score | Algebraically verified residual and fit-mask tests; the best scientific choice of objective and `I0` remains `UNVERIFIED` and user-controlled |
-| Preprocessing state | GUI preprocessing starts from the current displayed array | Repeated clicks compound transformations and are difficult to reproduce | Address during immutable session extraction |
+| Preprocessing state | `AnalysisSession` keeps immutable raw and processed scans plus an ordered operation list; every application recomputes from raw | Repeated clicks are idempotent and old fit results are invalidated while peak configuration is retained | Resolved with core Session and headless GUI state-transition tests |
 | Warning handling | Numerical warnings, solver success/message, covariance availability, evaluation count, and boundary hits are retained with the candidate result | Fit failures or degeneracy can otherwise be mistaken for a trustworthy solution | Global suppression removed; diagnostics are shown in the GUI and exported |
 | macOS background-fit crash | Crash report identified `Thread stack size exceeded` in `FittingThread` during OpenBLAS `dgetrf_parallel` covariance inversion | Native `SIGBUS` terminates the whole GUI before Python can report an error | Reserve a 16 MiB worker stack and limit BLAS to one thread inside the fit; retain covariance calculation |
 
@@ -53,6 +63,9 @@ The current tests establish only that:
 - partially numeric rows are skipped atomically, uncovered scan gaps remain missing rather than
   being filled with intensity, and missing observations are excluded from the fit mask;
 - the minimum peak separation follows adjacent fitted centers through an explicit gap parameter;
+- repeated preprocessing with the same ordered configuration is exactly idempotent from the
+  immutable raw scan, while scan/source hashes and retained-point counts provide project
+  provenance;
 - displayed, manually entered, and fixed Pseudo-Voigt FWHM values follow the same exact
   `FWHM = 2 * sigma` definition, with film bounds of 0.02–3.00° and substrate bounds of
   0.02–2.00° in 2θ;
