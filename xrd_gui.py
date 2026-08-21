@@ -1,20 +1,20 @@
 # xrd_gui.py - PyQt5 GUI界面
 
-import sys
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTableWidget,
     QTableWidgetItem, QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox,
-    QComboBox, QTextEdit, QSplitter, QTabWidget, QMessageBox,
+    QComboBox, QSplitter, QTabWidget, QMessageBox,
     QProgressBar, QListWidget, QListWidgetItem, QRadioButton,
-    QButtonGroup, QDialog, QDialogButtonBox, QFormLayout
+    QButtonGroup, QDialog, QDialogButtonBox, QFormLayout, QSlider
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QColor
 
 import numpy as np
 import matplotlib
@@ -23,10 +23,27 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+from threadpoolctl import threadpool_limits
 
-from xrd_analyzer import (
-    DataLoader, Preprocessor, Fitter, Reporter, Peak
+from app_metadata import WINDOW_TITLE
+from plot_style import apply_plot_style
+
+from xrd_backend import (
+    AnalysisSession,
+    BraggGeometry, DEFAULT_RADIATION_LABEL, DEFAULT_WAVELENGTH_ANGSTROM,
+    Fitter, FitterHistory, PROJECT_WORKBOOK_SCHEMA_VERSION,
+    FitConfiguration,
+    PSEUDO_VOIGT_FWHM_FACTOR, Reporter, RestoredFitResult, Peak,
+    PreprocessingStep,
+    ScanData,
+    XRDApplicationService,
 )
+
+
+apply_plot_style()
+
+
+FITTING_THREAD_STACK_SIZE_BYTES = 16 * 1024 * 1024
 
 
 class MplCanvas(FigureCanvas):
@@ -70,7 +87,7 @@ class InteractivePlotCanvas(MplCanvas):
         
     def plot_data(self):
         """绘制数据"""
-        self.axes.clear()
+        self.clear_axes()
         if self.x_data is not None and self.y_data is not None:
             self.axes.plot(self.x_data, self.y_data, 'b-', linewidth=1.5, label='Data')
             self.axes.set_xlabel('2θ (degree)', fontsize=11, fontweight='bold')
@@ -80,6 +97,11 @@ class InteractivePlotCanvas(MplCanvas):
             self.axes.grid(True, alpha=0.3)
             self.axes.legend()
         self.draw()
+
+    def clear_axes(self) -> None:
+        """完整清空坐标轴，并丢弃随之失效的峰标记引用。"""
+        self.peak_markers.clear()
+        self.axes.clear()
     
     def add_peak_marker(self, x_pos, y_pos, peak_id, name=''):
         """添加峰标记"""
@@ -101,7 +123,8 @@ class InteractivePlotCanvas(MplCanvas):
     def clear_peak_markers(self):
         """清除所有峰标记"""
         for marker in self.peak_markers:
-            marker.remove()
+            if getattr(marker, 'axes', None) is self.axes:
+                marker.remove()
         self.peak_markers.clear()
         self.draw()
     
@@ -131,7 +154,7 @@ class PeakConfigDialog(QDialog):
         
         # 峰名称
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("可选，例如: PZT(002)")
+        self.name_edit.setPlaceholderText("可选，例如: Sample(002)")
         layout.addRow("峰名称:", self.name_edit)
         
         # 峰中心
@@ -163,7 +186,8 @@ class PeakConfigDialog(QDialog):
         
         # 峰类型
         self.type_combo = QComboBox()
-        self.type_combo.addItems(['film', 'substrate'])
+        self.type_combo.addItem("样品峰", "film")
+        self.type_combo.addItem("基底峰", "substrate")
         layout.addRow("峰类型:", self.type_combo)
         
         # 按钮
@@ -182,7 +206,7 @@ class PeakConfigDialog(QDialog):
             'center': self.center_spin.value(),
             'min': self.min_spin.value(),
             'max': self.max_spin.value(),
-            'type': self.type_combo.currentText(),
+            'type': self.type_combo.currentData(),
             'name': self.name_edit.text().strip()
         }
 
@@ -194,29 +218,57 @@ class FittingThread(QThread):
     progress = pyqtSignal(int)
     error = pyqtSignal(str)
     
-    def __init__(self, fitter, constrain_fwhm, min_separation, log_weight=0.5, fixed_background=None):
+    def __init__(
+        self,
+        fitter,
+        constrain_fwhm,
+        min_separation,
+        log_weight=0.5,
+        fixed_background=None,
+        method='leastsq',
+        objective_mode='mixed',
+        intensity_floor=1.0,
+        include_ranges=None,
+        exclude_ranges=None,
+    ):
         super().__init__()
+        # macOS的默认QThread栈不足以承载OpenBLAS在lmfit协方差求逆时的
+        # 原生栈分配。显式预留空间，避免SIGBUS直接终止整个进程。
+        self.setStackSize(FITTING_THREAD_STACK_SIZE_BYTES)
         self.fitter = fitter
         self.constrain_fwhm = constrain_fwhm
         self.min_separation = min_separation
         self.log_weight = log_weight
         self.fixed_background = fixed_background
+        self.method = method
+        self.objective_mode = objective_mode
+        self.intensity_floor = intensity_floor
+        self.include_ranges = list(include_ranges or [])
+        self.exclude_ranges = list(exclude_ranges or [])
         
     def run(self):
         try:
-            self.progress.emit(20)
-            
-            # 构建模型
-            self.fitter.build_model(
-                constrain_fwhm=self.constrain_fwhm,
-                min_peak_separation=self.min_separation,
-                fixed_background=self.fixed_background
-            )
-            
-            self.progress.emit(40)
-            
-            # 执行拟合
-            result = self.fitter.execute_fitting(log_weight=self.log_weight)
+            # 科学结果不依赖BLAS线程数。限制为单线程可避免OpenBLAS在
+            # Qt后台线程中走并行LU求逆，同时也防止多套BLAS过度订阅。
+            with threadpool_limits(limits=1, user_api='blas'):
+                self.progress.emit(20)
+
+                self.fitter.build_model(
+                    constrain_fwhm=self.constrain_fwhm,
+                    min_peak_separation=self.min_separation,
+                    fixed_background=self.fixed_background
+                )
+
+                self.progress.emit(40)
+
+                result = self.fitter.execute_fitting(
+                    method=self.method,
+                    log_weight=self.log_weight,
+                    objective_mode=self.objective_mode,
+                    intensity_floor=self.intensity_floor,
+                    include_ranges=self.include_ranges,
+                    exclude_ranges=self.exclude_ranges,
+                )
             
             self.progress.emit(100)
             self.finished.emit(result)
@@ -230,6 +282,8 @@ class XRDAnalyzerGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
+
+        self.backend = XRDApplicationService()
         
         # 数据
         self.x_data = None
@@ -243,15 +297,75 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 多文件管理
         self.loaded_files_data = []  # List[Tuple[filepath, x, y]]
+        self.active_data_range = None  # 数据加载模块已提交的永久2theta范围
         
         # 处理对象
         self.fitter = None
         self.reporter = None
+        self.fit_thread = None
+        self.fit_history = FitterHistory(limit=5)
         
         self.init_ui()
+
+    @property
+    def session(self) -> AnalysisSession:
+        """兼容旧控制器代码的 backend Session 只读入口。"""
+        return self.backend.session
+
+    @session.setter
+    def session(self, session: AnalysisSession) -> None:
+        self.backend.set_session(session)
+
+    def _sync_legacy_data_views(self) -> None:
+        """从 Session 同步过渡期 GUI 字段，Session 始终是数据状态源。"""
+        if not self.session.has_data:
+            self.x_data = None
+            self.y_data = None
+            self.x_data_raw = None
+            self.y_data_raw = None
+            self.x_data_original = None
+            self.y_data_original = None
+            self.active_data_range = None
+            return
+
+        self.x_data = self.session.processed_scan.two_theta
+        self.y_data = self.session.processed_scan.intensity
+        self.x_data_raw = self.session.raw_scan.two_theta
+        self.y_data_raw = self.session.raw_scan.intensity
+        self.x_data_original = self.session.raw_scan.two_theta
+        self.y_data_original = self.session.raw_scan.intensity
+        self.active_data_range = self.session.active_range
+
+    def _ensure_session_from_legacy_data(self) -> None:
+        """兼容测试和旧调用方直接设置数组的过渡路径。"""
+        if self.session.has_data or self.x_data_raw is None or self.y_data_raw is None:
+            return
+        source_id = str(self.current_file or "")
+        source_scans = tuple(
+            ScanData(source_x, source_y, source_id=str(path))
+            for path, source_x, source_y in self.loaded_files_data
+        )
+        self.backend.restore_session(
+            self.x_data_raw,
+            self.y_data_raw,
+            self.y_data if self.y_data is not None else self.y_data_raw,
+            source_id=source_id,
+            active_range=self.active_data_range,
+            project_id=source_id,
+            source_scans=source_scans,
+        )
+        self._sync_legacy_data_views()
+
+    def _invalidate_fit_for_data_change(self, preserve_peaks: bool = True) -> None:
+        """数据改变后重建 Fitter，并仅保留仍有效的峰配置。"""
+        old_peaks = list(self.fitter.peaks) if preserve_peaks and self.fitter else []
+        for peak in old_peaks:
+            peak.clear_result()
+        self.fitter = self.backend.create_fitter(old_peaks)
+        self.reporter = None
         
     def init_ui(self):
-        self.setWindowTitle("XRD数据分析系统 - PZT薄膜专用")
+        self.setWindowTitle(WINDOW_TITLE)
         self.setGeometry(100, 100, 1400, 900)
         
         # 中心部件
@@ -327,6 +441,11 @@ class XRDAnalyzerGUI(QMainWindow):
         btn_layout.addWidget(app_reset_btn)
         
         file_layout.addLayout(btn_layout)
+
+        load_project_btn = QPushButton("加载Excel项目")
+        load_project_btn.setToolTip("读取本程序导出的Excel报告并恢复数据、峰和界面配置")
+        load_project_btn.clicked.connect(self.open_excel_project)
+        file_layout.addWidget(load_project_btn)
         
         # 文件列表
         self.file_list_widget = QListWidget()
@@ -426,7 +545,7 @@ class XRDAnalyzerGUI(QMainWindow):
         fit_layout = QVBoxLayout()
         
         # 约束选项
-        self.constrain_fwhm_cb = QCheckBox("强制薄膜峰FWHM相等")
+        self.constrain_fwhm_cb = QCheckBox("强制样品峰FWHM相等")
         fit_layout.addWidget(self.constrain_fwhm_cb)
         
         # 最小峰间距
@@ -447,14 +566,22 @@ class XRDAnalyzerGUI(QMainWindow):
         self.fit_method_combo.addItems(['leastsq', 'least_squares', 'nelder'])
         method_layout.addWidget(self.fit_method_combo)
         fit_layout.addLayout(method_layout)
+
+        objective_layout = QHBoxLayout()
+        objective_layout.addWidget(QLabel("目标函数:"))
+        self.objective_combo = QComboBox()
+        self.objective_combo.addItem("Linear", "linear")
+        self.objective_combo.addItem("Log", "log")
+        self.objective_combo.addItem("Mixed", "mixed")
+        self.objective_combo.setCurrentIndex(2)
+        objective_layout.addWidget(self.objective_combo)
+        fit_layout.addLayout(objective_layout)
         
         # 优化权重 (Log/Linear)
         weight_layout = QHBoxLayout()
         weight_layout.addWidget(QLabel("Log权重:"))
         
         self.log_weight_slider = QSpinBox() # 使用SpinBox简单直观，或者Slider+SpinBox联动
-        from PyQt5.QtWidgets import QSlider # 确保引入
-        
         self.log_slider = QSlider(Qt.Horizontal)
         self.log_slider.setRange(0, 100)
         self.log_slider.setValue(50)
@@ -472,6 +599,35 @@ class XRDAnalyzerGUI(QMainWindow):
         weight_layout.addWidget(self.log_slider)
         weight_layout.addWidget(self.log_spin)
         fit_layout.addLayout(weight_layout)
+
+        floor_layout = QHBoxLayout()
+        floor_layout.addWidget(QLabel("Log强度底值 I₀:"))
+        self.log_floor_spin = QDoubleSpinBox()
+        self.log_floor_spin.setRange(0.000001, 1000000.0)
+        self.log_floor_spin.setDecimals(6)
+        self.log_floor_spin.setValue(1.0)
+        self.log_floor_spin.setToolTip(
+            "Log残差使用log10(I + I₀)；I₀应依据噪声底人工设置"
+        )
+        floor_layout.addWidget(self.log_floor_spin)
+        fit_layout.addLayout(floor_layout)
+
+        self.objective_combo.currentIndexChanged.connect(self.update_objective_controls)
+        self.update_objective_controls()
+
+        include_layout = QHBoxLayout()
+        include_layout.addWidget(QLabel("包含区间:"))
+        self.include_ranges_input = QLineEdit()
+        self.include_ranges_input.setPlaceholderText("留空=全部；例 42.5-43.5; 54-56")
+        include_layout.addWidget(self.include_ranges_input)
+        fit_layout.addLayout(include_layout)
+
+        exclude_layout = QHBoxLayout()
+        exclude_layout.addWidget(QLabel("排除区间:"))
+        self.exclude_ranges_input = QLineEdit()
+        self.exclude_ranges_input.setPlaceholderText("例 42.8-43.2")
+        exclude_layout.addWidget(self.exclude_ranges_input)
+        fit_layout.addLayout(exclude_layout)
         
         # 背景强度设置
         bg_setting_layout = QHBoxLayout()
@@ -513,6 +669,14 @@ class XRDAnalyzerGUI(QMainWindow):
         refine_fit_btn.setStyleSheet("color: blue; font-weight: bold;")
         refine_fit_btn.clicked.connect(self.refine_fitting)
         fit_layout.addWidget(refine_fit_btn)
+
+        accept_fit_btn = QPushButton("接受当前结果作为下一轮初值")
+        accept_fit_btn.setToolTip(
+            "人工确认当前候选结果，并保存center、area、FWHM和η作为下一轮初值"
+        )
+        accept_fit_btn.clicked.connect(self.accept_current_fit)
+        fit_layout.addWidget(accept_fit_btn)
+        self.accept_fit_btn = accept_fit_btn
         
         fit_group.setLayout(fit_layout)
         col2_layout.addWidget(fit_group)
@@ -538,41 +702,71 @@ class XRDAnalyzerGUI(QMainWindow):
         # 添加上部区域到主布局
         main_layout.addWidget(top_section)
         
-        # === 下部区域：峰管理 (全宽) ===
+        # === 左下区域：峰识别与添加 ===
         
-        # 3. 峰管理组 (原 Group 3)
-        peak_group = QGroupBox("3. 峰识别与管理")
+        peak_group = QGroupBox("3. 峰识别与添加")
+        self.peak_setup_group = peak_group
+        # 保留旧属性供现有状态控制代码兼容使用。
+        self.peak_group = peak_group
         peak_layout = QVBoxLayout()
         
-        # 自动寻峰
-        auto_peak_layout = QHBoxLayout()
-        auto_peak_btn = QPushButton("自动寻峰")
-        auto_peak_btn.clicked.connect(self.auto_find_peaks)
-        auto_peak_layout.addWidget(auto_peak_btn)
-        
-        self.peak_threshold = QDoubleSpinBox()
-        self.peak_threshold.setRange(0, 100000)
-        self.peak_threshold.setValue(100)
-        self.peak_threshold.setPrefix("阈值: ")
-        auto_peak_layout.addWidget(self.peak_threshold)
-        peak_layout.addLayout(auto_peak_layout)
-        
-        # 快速添加
+        # 数值添加：直接2θ或由理论晶面间距d反算
         quick_add_layout = QHBoxLayout()
-        self.quick_peak_input = QLineEdit()
-        self.quick_peak_input.setPlaceholderText("角度 - 类型 - 名称 (例: 46.5 - film - PZT(002))")
-        quick_add_layout.addWidget(self.quick_peak_input)
+        self.peak_input_mode = QComboBox()
+        self.peak_input_mode.addItem("2θ位置 (°)", "two_theta")
+        self.peak_input_mode.addItem("理论晶面间距 d (Å)", "d_spacing")
+        quick_add_layout.addWidget(self.peak_input_mode)
+
+        self.peak_value_input = QDoubleSpinBox()
+        self.peak_value_input.setDecimals(6)
+        self.peak_value_input.setRange(0.000001, 179.999999)
+        self.peak_value_input.setValue(44.0)
+        self.peak_value_input.setSuffix(" °")
+        self.peak_value_input.setKeyboardTracking(False)
+        quick_add_layout.addWidget(self.peak_value_input)
+
+        self.peak_type_combo = QComboBox()
+        self.peak_type_combo.addItem("样品峰", "film")
+        self.peak_type_combo.addItem("基底峰", "substrate")
+        quick_add_layout.addWidget(self.peak_type_combo)
+
+        self.peak_name_input = QLineEdit()
+        self.peak_name_input.setPlaceholderText("峰名，例如 Sample(002)")
+        quick_add_layout.addWidget(self.peak_name_input)
         
         quick_add_btn = QPushButton("添加")
         quick_add_btn.clicked.connect(self.quick_add_peak)
         quick_add_layout.addWidget(quick_add_btn)
         peak_layout.addLayout(quick_add_layout)
+
+        wavelength_layout = QHBoxLayout()
+        wavelength_layout.addWidget(QLabel("X射线波长 λ:"))
+        self.wavelength_spin = QDoubleSpinBox()
+        self.wavelength_spin.setDecimals(6)
+        self.wavelength_spin.setRange(0.000001, 100.0)
+        self.wavelength_spin.setValue(DEFAULT_WAVELENGTH_ANGSTROM)
+        self.wavelength_spin.setSuffix(" Å")
+        self.wavelength_spin.setKeyboardTracking(False)
+        self.wavelength_spin.setToolTip(
+            "项目统一使用的X射线波长；默认 Cu Kα1 = 1.5406 Å"
+        )
+        self.wavelength_spin.valueChanged.connect(self.on_wavelength_changed)
+        wavelength_layout.addWidget(self.wavelength_spin)
+        wavelength_layout.addWidget(QLabel("默认 Cu Kα1"))
+        wavelength_layout.addStretch()
+        peak_layout.addLayout(wavelength_layout)
+        self.peak_input_mode.currentIndexChanged.connect(
+            self.update_peak_input_mode
+        )
         
         # 导入/导出峰
         io_peak_layout = QHBoxLayout()
-        import_peak_btn = QPushButton("导入峰列表 (.txt)")
+        import_peak_btn = QPushButton("导入峰位置 (.txt)")
         import_peak_btn.clicked.connect(self.import_peaks_from_file)
         io_peak_layout.addWidget(import_peak_btn)
+        export_peak_btn = QPushButton("导出拟合峰位置 (.txt)")
+        export_peak_btn.clicked.connect(self.export_fitted_peaks_to_file)
+        io_peak_layout.addWidget(export_peak_btn)
         peak_layout.addLayout(io_peak_layout)
         
         # 手动添加峰
@@ -582,11 +776,37 @@ class XRDAnalyzerGUI(QMainWindow):
         peak_layout.addWidget(manual_peak_btn)
         self.manual_peak_btn = manual_peak_btn
         
-        # 峰列表 (移除最大高度限制)
+        peak_group.setLayout(peak_layout)
+        main_layout.addWidget(peak_group, 1)
+
+        return panel
+
+    def create_peak_table_group(self) -> QGroupBox:
+        """创建位于图像下方、与图像同宽的峰管理表格。"""
+        peak_table_group = QGroupBox("峰值拟合管理")
+        self.peak_table_group = peak_table_group
+        table_layout = QVBoxLayout()
+
         self.peak_table = QTableWidget()
-        self.peak_table.setColumnCount(6)
+        self.peak_table.setColumnCount(9)
         self.peak_table.setHorizontalHeaderLabels(
-            ['ID', '名称', '位置 (Pos)', '高度 (Height)', 'FWHM', '类型']
+            [
+                'ID', '名称', '位置 (Pos)', '面积', '高度 (Height)',
+                'FWHM', 'η', '峰状态', '类型'
+            ]
+        )
+        self.peak_table.horizontalHeaderItem(3).setToolTip(
+            "拟合Pseudo-Voigt分布的积分面积（lmfit amplitude）"
+        )
+        self.peak_table.horizontalHeaderItem(5).setToolTip(
+            "Pseudo-Voigt半高全宽（2θ度）。样品峰允许0.02–3.00°，"
+            "基底峰允许0.02–2.00°；勾选后按输入值精确固定。"
+        )
+        self.peak_table.horizontalHeaderItem(6).setToolTip(
+            "Pseudo-Voigt Lorentzian比例，范围0–1"
+        )
+        self.peak_table.horizontalHeaderItem(7).setToolTip(
+            "优化=参数参与拟合；冻结=固定完整峰形；禁用=本轮峰分量为零"
         )
         self.peak_table.setMinimumHeight(200)
         
@@ -594,17 +814,74 @@ class XRDAnalyzerGUI(QMainWindow):
         self.peak_table.setColumnWidth(0, 40) # ID
         self.peak_table.setColumnWidth(1, 80) # Name
         self.peak_table.setColumnWidth(2, 100) # Pos
-        self.peak_table.setColumnWidth(3, 100) # Height
-        self.peak_table.setColumnWidth(4, 100) # FWHM
-        self.peak_table.setColumnWidth(5, 80) # Type
+        self.peak_table.setColumnWidth(3, 110) # Area
+        self.peak_table.setColumnWidth(4, 100) # Height
+        self.peak_table.setColumnWidth(5, 100) # FWHM
+        self.peak_table.setColumnWidth(6, 70) # Eta
+        self.peak_table.setColumnWidth(7, 90) # State
+        self.peak_table.setColumnWidth(8, 80) # Type
         
         # Connect itemChanged signal for live editing
         self.peak_table.itemChanged.connect(self.on_peak_table_changed)
         
-        peak_layout.addWidget(self.peak_table)
+        table_layout.addWidget(self.peak_table)
+
+        shift_layout = QHBoxLayout()
+        shift_layout.addWidget(QLabel("整体平移 2θ:"))
+        self.shift_left_btn = QPushButton("◀")
+        self.shift_left_btn.setFixedWidth(32)
+        self.shift_left_btn.setToolTip("所有峰向左移动一个步长")
+        self.shift_left_btn.clicked.connect(
+            lambda: self.apply_peak_shift(-self.peak_shift_step.value())
+        )
+        shift_layout.addWidget(self.shift_left_btn)
+
+        self.peak_shift_slider = QSlider(Qt.Horizontal)
+        self.peak_shift_slider.setRange(-10, 10)
+        self.peak_shift_slider.setValue(0)
+        self.peak_shift_slider.setTickPosition(QSlider.TicksBelow)
+        self.peak_shift_slider.setTickInterval(1)
+        self.peak_shift_slider.setToolTip(
+            "拖动后释放：按滑块格数×步长整体平移所有峰，随后自动回中"
+        )
+        self.peak_shift_slider.sliderReleased.connect(
+            self.apply_peak_shift_from_slider
+        )
+        shift_layout.addWidget(self.peak_shift_slider, 1)
+
+        self.shift_right_btn = QPushButton("▶")
+        self.shift_right_btn.setFixedWidth(32)
+        self.shift_right_btn.setToolTip("所有峰向右移动一个步长")
+        self.shift_right_btn.clicked.connect(
+            lambda: self.apply_peak_shift(self.peak_shift_step.value())
+        )
+        shift_layout.addWidget(self.shift_right_btn)
+
+        shift_layout.addWidget(QLabel("步长:"))
+        self.peak_shift_step = QDoubleSpinBox()
+        self.peak_shift_step.setDecimals(4)
+        self.peak_shift_step.setRange(0.0001, 1.0)
+        self.peak_shift_step.setSingleStep(0.001)
+        self.peak_shift_step.setValue(0.01)
+        self.peak_shift_step.setSuffix(" °")
+        self.peak_shift_step.setToolTip("峰位整体平移步长，单位为degree 2θ")
+        shift_layout.addWidget(self.peak_shift_step)
+        table_layout.addLayout(shift_layout)
         
         # 删除峰按钮
         peak_btn_layout = QHBoxLayout()
+        self.undo_fit_btn = QPushButton("撤销")
+        self.undo_fit_btn.setShortcut("Ctrl+Z")
+        self.undo_fit_btn.setToolTip("回到上一次已完成的拟合结果（最多5步）")
+        self.undo_fit_btn.clicked.connect(self.undo_fit_result)
+        peak_btn_layout.addWidget(self.undo_fit_btn)
+
+        self.redo_fit_btn = QPushButton("恢复")
+        self.redo_fit_btn.setShortcut("Ctrl+Shift+Z")
+        self.redo_fit_btn.setToolTip("恢复下一次已完成的拟合结果")
+        self.redo_fit_btn.clicked.connect(self.redo_fit_result)
+        peak_btn_layout.addWidget(self.redo_fit_btn)
+
         delete_peak_btn = QPushButton("删除选中峰")
         delete_peak_btn.clicked.connect(self.delete_selected_peak)
         peak_btn_layout.addWidget(delete_peak_btn)
@@ -612,14 +889,11 @@ class XRDAnalyzerGUI(QMainWindow):
         clear_peaks_btn = QPushButton("清除所有峰")
         clear_peaks_btn.clicked.connect(self.clear_all_peaks)
         peak_btn_layout.addWidget(clear_peaks_btn)
-        peak_layout.addLayout(peak_btn_layout)
-        
-        peak_group.setLayout(peak_layout)
-        
-        # 添加峰管理组到主布局，并给予伸缩因子1，使其占据剩余空间
-        main_layout.addWidget(peak_group, 1)
-        
-        return panel
+        table_layout.addLayout(peak_btn_layout)
+        self.update_fit_history_buttons()
+
+        peak_table_group.setLayout(table_layout)
+        return peak_table_group
     
     def create_right_panel(self):
         """创建右侧绘图区域"""
@@ -644,35 +918,357 @@ class XRDAnalyzerGUI(QMainWindow):
         
         tabs.addTab(data_tab, "数据与拟合")
         
-        # Tab 2: 结果详情
-        results_tab = QWidget()
-        results_layout = QVBoxLayout()
-        
-        self.results_text = QTextEdit()
-        self.results_text.setReadOnly(True)
-        self.results_text.setFont(QFont("Courier", 10))
-        results_layout.addWidget(self.results_text)
-        
-        results_tab.setLayout(results_layout)
-        tabs.addTab(results_tab, "拟合结果")
-        
-        # Tab 3: 物理参数
-        physics_tab = QWidget()
-        physics_layout = QVBoxLayout()
-        
-        self.physics_text = QTextEdit()
-        self.physics_text.setReadOnly(True)
-        self.physics_text.setFont(QFont("Courier", 10))
-        physics_layout.addWidget(self.physics_text)
-        
-        physics_tab.setLayout(physics_layout)
-        tabs.addTab(physics_tab, "物理参数")
-        
-        layout.addWidget(tabs)
+        self.analysis_tabs = tabs
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.addWidget(tabs)
+        self.right_splitter.addWidget(self.create_peak_table_group())
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setSizes([600, 300])
+        layout.addWidget(self.right_splitter)
         
         return panel
     
     # === 事件处理函数 ===
+
+    def collect_project_state(self) -> dict:
+        """收集恢复当前GUI分析会话所需的显式状态。"""
+        active_range = self.active_data_range
+        if active_range is None and self.x_data is not None and len(self.x_data):
+            active_range = (float(np.min(self.x_data)), float(np.max(self.x_data)))
+        return {
+            'schema_version': PROJECT_WORKBOOK_SCHEMA_VERSION,
+            'range_min': active_range[0] if active_range else self.range_min.value(),
+            'range_max': active_range[1] if active_range else self.range_max.value(),
+            'filter_type': self.filter_combo.currentText(),
+            'sg_window': self.sg_window.value(),
+            'background_preprocess': self.bg_combo.currentText(),
+            'poly_degree': self.poly_degree.value(),
+            'constrain_fwhm': self.constrain_fwhm_cb.isChecked(),
+            'min_separation': self.min_separation.value(),
+            'fit_method': self.fit_method_combo.currentText(),
+            'objective_mode': self.objective_combo.currentData(),
+            'log_weight': self.log_spin.value(),
+            'log_floor': self.log_floor_spin.value(),
+            'background_value': self.bg_spin.value(),
+            'background_fixed': self.bg_fix_cb.isChecked(),
+            'yscale': self.plot_canvas.yscale,
+            'include_ranges_text': self.include_ranges_input.text(),
+            'exclude_ranges_text': self.exclude_ranges_input.text(),
+            'wavelength_angstrom': self.wavelength_spin.value(),
+            'radiation_label': self.current_radiation_label(),
+            'peak_input_mode': self.peak_input_mode.currentData(),
+            'peak_shift_step_2theta_deg': self.peak_shift_step.value(),
+            'preprocessing_steps': [
+                step.to_record() for step in self.session.preprocessing
+            ],
+            'session_fit_configuration': self.session.fit_configuration.to_record(),
+            'raw_scan_sha256': (
+                self.session.raw_scan.content_sha256
+                if self.session.raw_scan is not None
+                else None
+            ),
+            'processed_scan_sha256': (
+                self.session.processed_scan.content_sha256
+                if self.session.processed_scan is not None
+                else None
+            ),
+            'raw_point_count': (
+                int(self.session.raw_scan.two_theta.size)
+                if self.session.raw_scan is not None
+                else 0
+            ),
+            'raw_valid_point_count': (
+                int(np.count_nonzero(self.session.raw_scan.valid_mask))
+                if self.session.raw_scan is not None
+                else 0
+            ),
+        }
+
+    @staticmethod
+    def _set_combo_text(combo: QComboBox, value) -> None:
+        if value is None:
+            return
+        index = combo.findText(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value) -> None:
+        if value is None:
+            return
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def apply_project_state(self, state: dict) -> None:
+        """恢复工作簿中保存的GUI配置，但不重复执行预处理。"""
+        self._set_combo_text(self.filter_combo, state.get('filter_type'))
+        self.sg_window.setValue(int(state.get('sg_window', 7)))
+        self._set_combo_text(
+            self.bg_combo,
+            state.get('background_preprocess', '无'),
+        )
+        self.poly_degree.setValue(int(state.get('poly_degree', 2)))
+        self.constrain_fwhm_cb.setChecked(bool(state.get('constrain_fwhm', False)))
+        self.min_separation.setValue(float(state.get('min_separation', 0.2)))
+        self._set_combo_text(self.fit_method_combo, state.get('fit_method', 'leastsq'))
+        self._set_combo_data(self.objective_combo, state.get('objective_mode', 'mixed'))
+        self.log_spin.setValue(int(state.get('log_weight', 50)))
+        self.log_floor_spin.setValue(float(state.get('log_floor', 1.0)))
+        self.bg_spin.setValue(float(state.get('background_value', 0.0)))
+        self.bg_fix_cb.setChecked(bool(state.get('background_fixed', False)))
+        self.include_ranges_input.setText(str(state.get('include_ranges_text', '')))
+        self.exclude_ranges_input.setText(str(state.get('exclude_ranges_text', '')))
+        self.wavelength_spin.setValue(
+            float(state.get('wavelength_angstrom', DEFAULT_WAVELENGTH_ANGSTROM))
+        )
+        self.peak_shift_step.setValue(
+            float(state.get('peak_shift_step_2theta_deg', 0.01))
+        )
+        self._set_combo_data(
+            self.peak_input_mode,
+            state.get('peak_input_mode', 'two_theta'),
+        )
+        if state.get('yscale') == 'log':
+            self.log_radio.setChecked(True)
+            self.plot_canvas.yscale = 'log'
+        else:
+            self.linear_radio.setChecked(True)
+            self.plot_canvas.yscale = 'linear'
+
+    def open_excel_project(self) -> None:
+        """选择并加载XRD Excel项目工作簿。"""
+        start_dir = self.last_data_dir if self.last_data_dir else ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载Excel项目",
+            start_dir,
+            "Excel Projects (*.xlsx *.xls)",
+        )
+        if not file_path:
+            return
+        if self.x_data is not None:
+            reply = QMessageBox.question(
+                self,
+                "替换当前项目",
+                "加载Excel项目将替换当前数据和峰设置，是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        try:
+            self.load_excel_project(file_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "项目加载失败", str(exc))
+
+    def load_excel_project(self, file_path: str) -> None:
+        """从Excel报告恢复数据、峰、候选拟合结果和GUI状态。"""
+        project = self.backend.load_project(file_path)
+        x_data = np.asarray(project['x_data'], dtype=float)
+        processed = np.asarray(project['processed_intensity'], dtype=float)
+        raw = np.asarray(project['raw_intensity'], dtype=float)
+        state = project['project_state']
+
+        self.clear_files()
+        self.reporter = None
+        self.peak_table.setRowCount(0)
+
+        self.current_file = str(file_path)
+        self.last_data_dir = str(Path(file_path).parent)
+        range_min = float(state.get('range_min', np.min(x_data)))
+        range_max = float(state.get('range_max', np.max(x_data)))
+        preprocessing_records = state.get('preprocessing_steps', [])
+        preprocessing_steps = tuple(
+            PreprocessingStep.from_record(record)
+            for record in preprocessing_records
+            if isinstance(record, dict)
+        )
+        source_datasets = project.get('source_datasets', [])
+        source_scans = tuple(
+            ScanData(source_x, source_y, source_id=str(path))
+            for path, source_x, source_y in source_datasets
+        )
+        if not source_scans:
+            source_scans = (ScanData(x_data, raw, source_id=str(file_path)),)
+        stored_fit_configuration = state.get('session_fit_configuration')
+        fit_configuration = (
+            FitConfiguration.from_record(stored_fit_configuration)
+            if isinstance(stored_fit_configuration, dict)
+            else None
+        )
+        self.backend.restore_session(
+            x_data,
+            raw,
+            processed,
+            source_id=str(file_path),
+            active_range=(range_min, range_max),
+            project_id=str(file_path),
+            preprocessing=preprocessing_steps,
+            source_scans=source_scans,
+            fit_configuration=fit_configuration,
+        )
+        self._sync_legacy_data_views()
+        self.range_min.setValue(range_min)
+        self.range_max.setValue(range_max)
+        self.loaded_files_data = [
+            (scan.source_id, scan.two_theta, scan.intensity)
+            for scan in self.session.source_scans
+        ]
+        source_paths = project.get('source_files', [])
+        if self.loaded_files_data:
+            for path, _, _ in self.loaded_files_data:
+                item = QListWidgetItem(Path(path).name)
+                item.setToolTip(path)
+                self.file_list_widget.addItem(item)
+        else:
+            project_item = QListWidgetItem(f"项目: {Path(file_path).name}")
+            project_item.setToolTip(
+                "\n".join(source_paths) if source_paths else str(file_path)
+            )
+            self.file_list_widget.addItem(project_item)
+        self.apply_project_state(state)
+
+        self.fitter = Fitter(self.x_data, self.y_data)
+        peak_records = sorted(
+            project['peaks'],
+            key=lambda record: record.get('Peak_ID', 0),
+        )
+
+        def number(record, key, fallback=None):
+            value = record.get(key)
+            return fallback if value is None else float(value)
+
+        for record in peak_records:
+            fitted_center = number(record, 'Center_2theta')
+            center_guess = number(record, 'Center_Guess_2theta', fitted_center)
+            if center_guess is None:
+                continue
+            bounds = (
+                number(record, 'Bounds_Min_2theta', center_guess - 0.5),
+                number(record, 'Bounds_Max_2theta', center_guess + 0.5),
+            )
+            peak = self.fitter.add_peak(
+                center_guess,
+                bounds,
+                str(record.get('Type') or 'film'),
+                str(record.get('Name') or ''),
+            )
+            peak.center = fitted_center
+            peak.area = number(record, 'Area')
+            peak.height = number(record, 'Height')
+            peak.fwhm = number(record, 'FWHM')
+            peak.eta = number(record, 'Eta_PseudoVoigt')
+            peak.area_guess = number(record, 'Area_Guess', peak.area)
+            peak.height_guess = number(record, 'Height_Guess', peak.height)
+            peak.sigma_guess = number(
+                record,
+                'Sigma_Guess',
+                peak.fwhm / PSEUDO_VOIGT_FWHM_FACTOR if peak.fwhm is not None else None,
+            )
+            peak.fraction_guess = number(record, 'Fraction_Guess', peak.eta)
+            peak.fixed_center = bool(record.get('Fixed_Center') or False)
+            peak.fixed_height = bool(record.get('Fixed_Height') or False)
+            peak.fixed_fwhm = bool(record.get('Fixed_FWHM') or False)
+            fit_state = str(record.get('Fit_State') or 'optimize')
+            peak.fit_state = (
+                fit_state
+                if fit_state in {'optimize', 'frozen', 'disabled'}
+                else 'optimize'
+            )
+
+        fitted_intensity = project.get('fitted_intensity')
+        has_complete_fit = fitted_intensity is not None and all(
+            peak.center is not None
+            and peak.area is not None
+            and peak.fwhm is not None
+            and peak.eta is not None
+            for peak in self.fitter.peaks
+        )
+        self.fitter.fit_config = dict(project.get('fit_config', {}))
+        self.fitter.fit_diagnostics = dict(project.get('fit_config', {}))
+
+        if has_complete_fit and self.fitter.peaks:
+            saved_states = [
+                (
+                    peak.fit_state,
+                    peak.fixed_center,
+                    peak.fixed_height,
+                    peak.fixed_fwhm,
+                )
+                for peak in self.fitter.peaks
+            ]
+            for peak in self.fitter.peaks:
+                peak.fit_state = 'optimize'
+                peak.fixed_center = False
+                peak.fixed_height = False
+                peak.fixed_fwhm = False
+            background = project.get('background')
+            background_value = float(background[0]) if background is not None else 0.0
+            self.fitter.build_model(
+                min_peak_separation=0.0,
+                fixed_background=background_value,
+            )
+            for peak, record in zip(self.fitter.peaks, peak_records):
+                prefix = f'p{peak.peak_id}_'
+                self.fitter.params[f'{prefix}center'].set(value=peak.center)
+                self.fitter.params[f'{prefix}amplitude'].set(value=peak.area)
+                self.fitter.params[f'{prefix}sigma'].set(
+                    value=peak.fwhm / PSEUDO_VOIGT_FWHM_FACTOR
+                )
+                self.fitter.params[f'{prefix}fraction'].set(value=peak.eta)
+            self.fitter.params.update_constraints()
+            for peak, saved in zip(self.fitter.peaks, saved_states):
+                (
+                    peak.fit_state,
+                    peak.fixed_center,
+                    peak.fixed_height,
+                    peak.fixed_fwhm,
+                ) = saved
+
+            diagnostics = self.fitter.fit_diagnostics
+            metrics = project.get('metrics', {})
+            self.fitter.result = RestoredFitResult(
+                params=self.fitter.params,
+                success=bool(diagnostics.get('success', True)),
+                message=str(diagnostics.get('message', 'Restored from Excel project')),
+                nfev=int(diagnostics.get('nfev') or 0),
+                covar=None,
+                chisqr=float(metrics.get('Objective_SSE') or np.nan),
+            )
+            self.fitter.y_fit = np.asarray(fitted_intensity, dtype=float)
+            try:
+                include_ranges = self.parse_fit_ranges(
+                    str(state.get('include_ranges_text', ''))
+                )
+                exclude_ranges = self.parse_fit_ranges(
+                    str(state.get('exclude_ranges_text', ''))
+                )
+                self.fitter.fit_mask = Fitter.build_fit_mask(
+                    self.x_data,
+                    include_ranges,
+                    exclude_ranges,
+                    y_data=self.y_data,
+                )
+            except ValueError:
+                self.fitter.fit_mask = np.ones_like(self.x_data, dtype=bool)
+            self.reporter = Reporter(
+                self.fitter,
+                x_original=self.x_data_original,
+                y_original=self.y_data_original,
+                wavelength_angstrom=self.wavelength_spin.value(),
+                radiation_label=self.current_radiation_label(),
+            )
+            self.reporter.calculate_metrics()
+            self.plot_fitted_results()
+            self.update_peak_table()
+        else:
+            self.reporter = None
+            self.update_peak_table()
+            self.redraw_peak_guesses()
+
+        self.statusBar().showMessage(f"Excel项目已恢复: {Path(file_path).name}")
     
     def add_files(self):
         """添加文件"""
@@ -695,8 +1291,13 @@ class XRDAnalyzerGUI(QMainWindow):
                 if any(f[0] == file_path for f in self.loaded_files_data):
                     continue
                     
-                x, y = DataLoader.load_txt(file_path)
-                self.loaded_files_data.append((file_path, x, y))
+                source_scan = self.backend.load_source(
+                    file_path,
+                    self.active_data_range,
+                )
+                self.loaded_files_data.append(
+                    (file_path, source_scan.two_theta, source_scan.intensity)
+                )
                 
                 # 添加到列表UI
                 item = QListWidgetItem(Path(file_path).name)
@@ -732,23 +1333,24 @@ class XRDAnalyzerGUI(QMainWindow):
         """清空文件"""
         self.loaded_files_data.clear()
         self.file_list_widget.clear()
-        self.x_data = None
-        self.y_data = None
-        self.x_data_raw = None
-        self.y_data_raw = None
-        self.x_data_original = None
-        self.y_data_original = None
-        self.plot_canvas.axes.clear()
+        self.backend.clear()
+        self._sync_legacy_data_views()
+        self.plot_canvas.clear_axes()
         self.plot_canvas.draw()
         self.current_file = None
         
         # 同时也应该清除fitter，因为数据没了
         self.fitter = None
+        self.clear_fit_history()
         
         self.statusBar().showMessage('列表已清空')
 
     def reset_app(self):
         """重置整个应用状态"""
+        if self.is_fitting():
+            QMessageBox.warning(self, "拟合进行中", "请等待当前拟合结束后再重置系统")
+            return
+
         reply = QMessageBox.question(
             self, '确认重置', 
             "确定要重置系统吗？\n这将清除所有已加载的数据、峰设置和拟合结果。",
@@ -756,31 +1358,53 @@ class XRDAnalyzerGUI(QMainWindow):
         )
         
         if reply == QMessageBox.Yes:
-            # 1. 清除文件和数据
+            # clear_files会销毁fitter，因此先直接清空依赖fitter的峰表格。
+            if self.fitter is not None:
+                self.fitter.clear_peaks()
+            self.peak_table.setRowCount(0)
+
+            # 清除文件、数据、绘图和模型对象。
             self.clear_files()
-            
-            # 2. 清除峰
-            self.clear_all_peaks() # 这会处理 self.fitter.peaks 和 UI
-            
-            # 3. 强制销毁对象
             self.fitter = None
             self.reporter = None
-            
-            # 4. 清除结果显示
-            self.results_text.clear()
-            self.physics_text.clear()
-            
-            # 5. 重置UI控件状态
+            self.fit_thread = None
+
+            self.clear_fit_history()
+
+            # 恢复所有会改变下一次分析的控件默认值。
+            self.filter_combo.setCurrentIndex(0)
+            self.sg_window.setValue(7)
+            self.bg_combo.setCurrentIndex(0)
+            self.poly_degree.setValue(2)
+            self.constrain_fwhm_cb.setChecked(False)
+            self.min_separation.setValue(0.2)
+            self.fit_method_combo.setCurrentIndex(0)
+            self.objective_combo.setCurrentIndex(2)
+            self.log_spin.setValue(50)
+            self.log_floor_spin.setValue(1.0)
+            self.include_ranges_input.clear()
+            self.exclude_ranges_input.clear()
+            self.bg_spin.setValue(0.0)
+            self.bg_fix_cb.setChecked(False)
+            self.linear_radio.setChecked(True)
+            self.plot_canvas.yscale = 'linear'
+            self.peak_input_mode.setCurrentIndex(0)
+            self.peak_value_input.setValue(44.0)
+            self.peak_type_combo.setCurrentIndex(0)
+            self.peak_name_input.clear()
+            self.wavelength_spin.setValue(DEFAULT_WAVELENGTH_ANGSTROM)
+            self.peak_shift_step.setValue(0.01)
+            self.peak_shift_slider.setValue(0)
+
             self.manual_peak_btn.setChecked(False)
             self.plot_canvas.mode = 'view'
             self.manual_peak_btn.setText("手动添加峰 (点击图上)")
             self.progress_bar.setVisible(False)
             self.progress_bar.setValue(0)
-            
-            # 6. 重置范围控件 (可选，恢复默认值)
+
             self.range_min.setValue(20)
             self.range_max.setValue(120)
-            
+
             self.statusBar().showMessage('系统已重置，就绪')
 
     def update_merged_data(self):
@@ -789,17 +1413,7 @@ class XRDAnalyzerGUI(QMainWindow):
             self.clear_files()
             return
             
-        # 提取所有数据进行拼接
-        datasets = [(d[1], d[2]) for d in self.loaded_files_data]
-        
         try:
-            x_merged, y_merged = DataLoader.stitch_datasets(datasets)
-            
-            self.x_data_raw = x_merged
-            self.y_data_raw = y_merged
-            self.x_data_original = x_merged.copy()
-            self.y_data_original = y_merged.copy()
-            
             # 更新当前文件名为第一个文件 + 标识
             first_file = Path(self.loaded_files_data[0][0]).stem
             if len(self.loaded_files_data) > 1:
@@ -807,12 +1421,28 @@ class XRDAnalyzerGUI(QMainWindow):
             else:
                 self.current_file = self.loaded_files_data[0][0]
                 
-            # 更新范围显示
-            self.range_min.setValue(x_merged.min())
-            self.range_max.setValue(x_merged.max())
-            
-            # 应用当前范围设置（这也将触发绘图更新）
-            self.apply_range()
+            self.backend.merge_sources(
+                self.loaded_files_data,
+                active_range=self.active_data_range,
+                project_id=str(self.current_file),
+            )
+            self._sync_legacy_data_views()
+            x_merged = self.session.raw_scan.two_theta
+
+            # 数据源改变后，旧峰和拟合结果不再对应当前数据。
+            self.fitter = None
+            self.reporter = None
+            self.peak_table.setRowCount(0)
+            self.clear_fit_history()
+
+            if self.active_data_range is None:
+                self.range_min.setValue(x_merged.min())
+                self.range_max.setValue(x_merged.max())
+            else:
+                self.range_min.setValue(self.active_data_range[0])
+                self.range_max.setValue(self.active_data_range[1])
+
+            self.plot_canvas.set_data(self.x_data, self.y_data)
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"数据合并失败:\n{str(e)}")
@@ -824,62 +1454,170 @@ class XRDAnalyzerGUI(QMainWindow):
         else:
             self.plot_canvas.set_yscale('log')
 
+    def update_objective_controls(self) -> None:
+        """根据目标函数显示真正生效的Log配置。"""
+        mode = self.objective_combo.currentData()
+        self.log_slider.setEnabled(mode == 'mixed')
+        self.log_spin.setEnabled(mode == 'mixed')
+        self.log_floor_spin.setEnabled(mode in {'log', 'mixed'})
+
+    @staticmethod
+    def parse_fit_ranges(text: str) -> List[tuple[float, float]]:
+        """解析用户输入的2theta区间列表。"""
+        stripped = text.strip()
+        if not stripped:
+            return []
+
+        ranges = []
+        pattern = re.compile(
+            r"^\s*([0-9]+(?:\.[0-9]*)?)\s*[-–—:]\s*"
+            r"([0-9]+(?:\.[0-9]*)?)\s*$"
+        )
+        for token in re.split(r"[;,，；]+", stripped):
+            match = pattern.match(token)
+            if match is None:
+                raise ValueError(f"无法识别拟合区间: {token.strip()}")
+            lower, upper = map(float, match.groups())
+            ranges.append(tuple(sorted((lower, upper))))
+        return ranges
+
+    def current_fit_configuration(self) -> FitConfiguration:
+        """将当前 GUI 控件转换为经过验证的核心拟合配置。"""
+        include_ranges = tuple(
+            self.parse_fit_ranges(self.include_ranges_input.text())
+        )
+        exclude_ranges = tuple(
+            self.parse_fit_ranges(self.exclude_ranges_input.text())
+        )
+        fixed_background = (
+            self.bg_spin.value() if self.bg_fix_cb.isChecked() else None
+        )
+        return FitConfiguration(
+            method=self.fit_method_combo.currentText(),
+            objective_mode=self.objective_combo.currentData(),
+            log_weight=self.log_spin.value() / 100.0,
+            intensity_floor=self.log_floor_spin.value(),
+            constrain_fwhm=self.constrain_fwhm_cb.isChecked(),
+            min_peak_separation=self.min_separation.value(),
+            fixed_background=fixed_background,
+            include_ranges=include_ranges,
+            exclude_ranges=exclude_ranges,
+        )
+
 
     
     def apply_range(self):
-        """应用数据范围"""
+        """提交数据加载范围，并永久裁剪当前项目中的全部数据。"""
+        self._ensure_session_from_legacy_data()
         if self.x_data_raw is None:
             return
         
         x_min = self.range_min.value()
         x_max = self.range_max.value()
-        
-        self.x_data, self.y_data = DataLoader.trim_range(
-            self.x_data_raw, self.y_data_raw, x_min, x_max
-        )
-        
-        self.plot_canvas.set_data(self.x_data, self.y_data)
-        self.statusBar().showMessage(f'数据范围: {x_min:.2f} - {x_max:.2f}°')
+        if x_min >= x_max:
+            QMessageBox.warning(self, "范围错误", "2θ范围下限必须小于上限")
+            return
+
+        try:
+            cropped_session = self.backend.crop(x_min, x_max)
+        except ValueError:
+            QMessageBox.warning(self, "范围错误", "所选2θ范围内没有数据")
+            return
+
+        old_peaks = list(self.fitter.peaks) if self.fitter is not None else []
+
+        self.session = cropped_session
+        self._sync_legacy_data_views()
+
+        self.loaded_files_data = [
+            (scan.source_id, scan.two_theta, scan.intensity)
+            for scan in self.session.source_scans
+        ]
+        self.file_list_widget.clear()
+        for path, _, _ in self.loaded_files_data:
+            item = QListWidgetItem(Path(path).name)
+            item.setToolTip(path)
+            self.file_list_widget.addItem(item)
+
+        self.reporter = None
+
+        removed_peak_count = 0
+        if old_peaks:
+            in_range_peaks = []
+            for peak in old_peaks:
+                if x_min <= peak.center_guess <= x_max:
+                    peak.bounds = (
+                        max(peak.bounds[0], x_min),
+                        min(peak.bounds[1], x_max),
+                    )
+                    peak.clear_result()
+                    in_range_peaks.append(peak)
+                else:
+                    removed_peak_count += 1
+            self.fitter = Fitter(self.x_data, self.y_data)
+            self.fitter.peaks = in_range_peaks
+            for peak_id, peak in enumerate(self.fitter.peaks):
+                peak.peak_id = peak_id
+            self.update_peak_table()
+            self.redraw_peak_guesses()
+        else:
+            self.fitter = None
+            self.peak_table.setRowCount(0)
+            self.plot_canvas.set_data(self.x_data, self.y_data)
+
+        self.clear_fit_history()
+
+        message = f"项目数据已裁剪至 {x_min:.2f}–{x_max:.2f}°"
+        if removed_peak_count:
+            message += f"，移除 {removed_peak_count} 个范围外峰"
+        self.statusBar().showMessage(message)
     
     def apply_preprocessing(self):
-        """应用预处理"""
-        if self.y_data is None:
+        """从不可变原始扫描重新执行当前预处理配置。"""
+        self._ensure_session_from_legacy_data()
+        if not self.session.has_data:
             return
-        
-        y_processed = self.y_data.copy()
-        
+
+        steps = []
         # 滤波
         filter_type = self.filter_combo.currentText()
         if filter_type == 'Savitzky-Golay':
             window = self.sg_window.value()
             if window % 2 == 0:
                 window += 1
-            y_processed = Preprocessor.apply_savgol_filter(y_processed, window, 3)
+            steps.append(PreprocessingStep.savgol(window, 3))
         elif filter_type == '高斯滤波':
-            y_processed = Preprocessor.apply_gaussian_filter(y_processed, sigma=1.5)
+            steps.append(PreprocessingStep.gaussian(sigma=1.5))
         elif filter_type == 'FFT滤波':
-            y_processed = Preprocessor.apply_fft_filter(y_processed, cutoff_freq=0.1)
-        
+            steps.append(PreprocessingStep.fft(cutoff_freq=0.1))
+
         # 背景扣除
         bg_type = self.bg_combo.currentText()
         if bg_type == '多项式':
-            degree = self.poly_degree.value()
-            y_processed, bg = Preprocessor.subtract_background_polynomial(
-                self.x_data, y_processed, degree
+            steps.append(
+                PreprocessingStep.polynomial_background(self.poly_degree.value())
             )
         elif bg_type == 'SNIP':
-            y_processed, bg = Preprocessor.subtract_background_snip(y_processed, iterations=40)
-        
-        self.y_data = y_processed
+            steps.append(PreprocessingStep.snip_background(iterations=40))
+
+        self.backend.apply_preprocessing(steps)
+        self._sync_legacy_data_views()
+        self._invalidate_fit_for_data_change(preserve_peaks=True)
         self.plot_canvas.set_data(self.x_data, self.y_data)
+        self.update_peak_table()
+        self.redraw_peak_guesses()
         self.statusBar().showMessage('预处理完成')
     
     def reset_to_raw(self):
         """重置为原始数据"""
-        if self.x_data_raw is not None:
-            self.x_data = self.x_data_raw.copy()
-            self.y_data = self.y_data_raw.copy()
+        self._ensure_session_from_legacy_data()
+        if self.session.has_data:
+            self.backend.reset_preprocessing()
+            self._sync_legacy_data_views()
+            self._invalidate_fit_for_data_change(preserve_peaks=True)
             self.plot_canvas.set_data(self.x_data, self.y_data)
+            self.update_peak_table()
+            self.redraw_peak_guesses()
             self.statusBar().showMessage('已重置为原始数据')
 
     
@@ -907,44 +1645,122 @@ class XRDAnalyzerGUI(QMainWindow):
                 values['name']
             )
             
-    def auto_find_peaks(self):
-        """自动寻峰"""
-        if self.x_data is None or self.y_data is None:
-            QMessageBox.warning(self, "警告", "请先加载数据")
-            return
-        
-        # 创建临时fitter
-        temp_fitter = Fitter(self.x_data, self.y_data)
-        threshold = self.peak_threshold.value()
-        
-        peak_positions = temp_fitter.auto_find_peaks(height_threshold=threshold)
-        
-        if not peak_positions:
-            QMessageBox.information(self, "信息", "未找到峰")
-            return
-        
-        # 清除现有峰
-        self.clear_all_peaks()
-        
-        # 添加找到的峰
-        for pos in peak_positions:
-            self.add_peak_to_fitter(pos, (pos - 0.5, pos + 0.5), 'film')
-        
-        self.statusBar().showMessage(f'自动找到 {len(peak_positions)} 个峰')
-    
     def add_peak_to_fitter(self, center, bounds, peak_type, name=''):
         """添加峰到拟合器"""
         if self.fitter is None:
             self.fitter = Fitter(self.x_data, self.y_data)
-        
-        peak = self.fitter.add_peak(center, bounds, peak_type, name)
-        
-        # 更新表格
+
+        self.fitter.add_peak(center, bounds, peak_type, name)
+        self.refresh_after_peak_change()
+
+    def is_fitting(self) -> bool:
+        """返回后台拟合线程是否仍在运行。"""
+        return self.fit_thread is not None and self.fit_thread.isRunning()
+
+    def set_peak_editing_enabled(self, enabled: bool) -> None:
+        """拟合期间统一锁定或恢复峰编辑区域。"""
+        if not enabled:
+            self.manual_peak_btn.setChecked(False)
+            self.manual_peak_btn.setText("手动添加峰 (点击图上)")
+            self.plot_canvas.mode = 'view'
+        self.peak_setup_group.setEnabled(enabled)
+        self.peak_table_group.setEnabled(enabled)
+        self.update_fit_history_buttons()
+
+    def clear_stale_fit_display(self) -> None:
+        """清除不再对应当前峰配置的结果展示。"""
+        self.reporter = None
+
+    def redraw_peak_guesses(self) -> None:
+        """以当前数据和峰初始位置重绘配置视图。"""
+        if self.x_data is None or self.y_data is None:
+            self.plot_canvas.clear_axes()
+            self.plot_canvas.draw()
+            return
+
+        self.plot_canvas.set_data(self.x_data, self.y_data)
+        if self.fitter is None:
+            return
+
+        for peak in self.fitter.peaks:
+            idx = np.argmin(np.abs(self.x_data - peak.center_guess))
+            self.plot_canvas.add_peak_marker(
+                peak.center_guess,
+                self.y_data[idx],
+                peak.peak_id,
+                peak.name,
+            )
+
+    def refresh_after_peak_change(self) -> None:
+        """同步峰表格、结果面板和绘图，避免显示旧拟合状态。"""
         self.update_peak_table()
-        
-        # 在图上标记
-        idx = np.argmin(np.abs(self.x_data - center))
-        self.plot_canvas.add_peak_marker(center, self.y_data[idx], peak.peak_id, name)
+        self.clear_stale_fit_display()
+        self.redraw_peak_guesses()
+        self.update_fit_history_buttons()
+
+    def record_completed_fit(self) -> None:
+        """仅在一次拟合产生完整结果后追加历史节点。"""
+        self.fit_history.record(self.fitter)
+        self.update_fit_history_buttons()
+
+    def clear_fit_history(self) -> None:
+        """数据项目改变后清除不再适用的拟合结果历史。"""
+        self.fit_history.clear()
+        self.update_fit_history_buttons()
+
+    def update_fit_history_buttons(self) -> None:
+        if not hasattr(self, 'undo_fit_btn'):
+            return
+        enabled = not self.is_fitting()
+        self.undo_fit_btn.setEnabled(enabled and self.fit_history.can_undo)
+        self.redo_fit_btn.setEnabled(enabled and self.fit_history.can_redo)
+
+    def restore_fit_history_state(self, snapshot, action: str) -> None:
+        """恢复峰表格及与该状态对应的完整拟合展示。"""
+        if self.x_data is None or self.y_data is None:
+            return
+        self.fitter = Fitter(self.x_data, self.y_data)
+        snapshot.restore_into(self.fitter)
+        for peak_id, peak in enumerate(self.fitter.peaks):
+            peak.peak_id = peak_id
+        self.update_peak_table()
+
+        if self.fitter.result is not None and self.fitter.y_fit is not None:
+            self.reporter = Reporter(
+                self.fitter,
+                x_original=self.x_data_original,
+                y_original=self.y_data_original,
+                wavelength_angstrom=self.wavelength_spin.value(),
+                radiation_label=self.current_radiation_label(),
+            )
+            self.reporter.calculate_metrics()
+            self.plot_fitted_results()
+            status = f"已{action}到对应拟合结果"
+        else:
+            self.clear_stale_fit_display()
+            self.redraw_peak_guesses()
+            status = f"已{action}到对应拟合结果"
+
+        self.update_fit_history_buttons()
+        self.statusBar().showMessage(status)
+
+    def undo_fit_result(self) -> None:
+        """回退到上一个已完成的拟合结果。"""
+        if self.is_fitting():
+            return
+        restored = self.fit_history.undo()
+        if restored is None:
+            return
+        self.restore_fit_history_state(restored, "撤销")
+
+    def redo_fit_result(self) -> None:
+        """恢复下一个已完成的拟合结果。"""
+        if self.is_fitting():
+            return
+        restored = self.fit_history.redo()
+        if restored is None:
+            return
+        self.restore_fit_history_state(restored, "恢复")
         
     def update_peak_table(self):
         """更新峰表格"""
@@ -953,6 +1769,7 @@ class XRDAnalyzerGUI(QMainWindow):
         
         self.peak_table.blockSignals(True)
         self.peak_table.setRowCount(len(self.fitter.peaks))
+        boundary_hits = set(self.fitter.fit_diagnostics.get('boundary_hits', []))
         
         for i, peak in enumerate(self.fitter.peaks):
             # 0. ID
@@ -966,30 +1783,95 @@ class XRDAnalyzerGUI(QMainWindow):
             item_pos = QTableWidgetItem(f"{center_val:.3f}")
             item_pos.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_pos.setCheckState(Qt.Checked if peak.fixed_center else Qt.Unchecked)
+            if any(
+                f"p{peak.peak_id}_center:{side}" in boundary_hits
+                for side in ('min', 'max')
+            ):
+                item_pos.setBackground(QColor(255, 235, 130))
             self.peak_table.setItem(i, 2, item_pos)
             
-            # 3. 高度 (Height) - 拟合前NaN
-            if peak.height is not None:
-                val_str = f"{peak.height:.2f}"
+            # 3. 面积 (Area) - lmfit PseudoVoigtModel的amplitude，拟合前NaN
+            area_value = peak.area if peak.area is not None else peak.area_guess
+            if area_value is not None:
+                val_str = f"{area_value:.2f}"
+            else:
+                val_str = "NaN"
+            item_area = QTableWidgetItem(val_str)
+            item_area.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            if any(
+                f"p{peak.peak_id}_amplitude:{side}" in boundary_hits
+                for side in ('min', 'max')
+            ):
+                item_area.setBackground(QColor(255, 235, 130))
+            self.peak_table.setItem(i, 3, item_area)
+
+            # 4. 高度 (Height) - 拟合前NaN
+            height_value = peak.height if peak.height is not None else peak.height_guess
+            if height_value is not None:
+                val_str = f"{height_value:.2f}"
             else:
                 val_str = "NaN"
             item_h = QTableWidgetItem(val_str)
             item_h.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_h.setCheckState(Qt.Checked if peak.fixed_height else Qt.Unchecked)
-            self.peak_table.setItem(i, 3, item_h)
+            self.peak_table.setItem(i, 4, item_h)
             
-            # 4. FWHM - 拟合前NaN
+            # 5. FWHM - 拟合结果优先，否则显示用户设置的初始猜测
             if peak.fwhm is not None:
                 val_str = f"{peak.fwhm:.4f}"
+            elif peak.sigma_guess is not None:
+                val_str = f"{PSEUDO_VOIGT_FWHM_FACTOR * peak.sigma_guess:.4f}"
             else:
                 val_str = "NaN"
             item_w = QTableWidgetItem(val_str)
             item_w.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
             item_w.setCheckState(Qt.Checked if peak.fixed_fwhm else Qt.Unchecked)
-            self.peak_table.setItem(i, 4, item_w)
-            
-            # 5. 类型
-            self.peak_table.setItem(i, 5, QTableWidgetItem(peak.peak_type))
+            if any(
+                f"p{peak.peak_id}_sigma:{side}" in boundary_hits
+                for side in ('min', 'max')
+            ):
+                item_w.setBackground(QColor(255, 235, 130))
+            fwhm_min, fwhm_max = Fitter.fwhm_bounds(peak.peak_type)
+            item_w.setToolTip(
+                f"允许范围：{fwhm_min:.2f}–{fwhm_max:.2f}°（2θ）。"
+                "未勾选时作为拟合初值；勾选时精确固定为该值。"
+            )
+            self.peak_table.setItem(i, 5, item_w)
+
+            # 6. Pseudo-Voigt Lorentzian比例η
+            eta_value = peak.eta if peak.eta is not None else peak.fraction_guess
+            item_eta = QTableWidgetItem(
+                f"{eta_value:.4f}" if eta_value is not None else "NaN"
+            )
+            item_eta.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+            )
+            item_eta.setToolTip("0=Gaussian，1=Lorentzian；冻结时作为完整峰形的一部分固定")
+            if any(
+                f"p{peak.peak_id}_fraction:{side}" in boundary_hits
+                for side in ('min', 'max')
+            ):
+                item_eta.setBackground(QColor(255, 235, 130))
+            self.peak_table.setItem(i, 6, item_eta)
+
+            # 7. 本轮峰状态
+            state_combo = QComboBox()
+            state_combo.addItem("优化", "optimize")
+            state_combo.addItem("冻结", "frozen")
+            state_combo.addItem("禁用", "disabled")
+            state_index = state_combo.findData(peak.fit_state)
+            state_combo.setCurrentIndex(max(state_index, 0))
+            state_combo.currentIndexChanged.connect(
+                lambda _index, peak_id=peak.peak_id, combo=state_combo:
+                self.set_peak_fit_state(peak_id, combo.currentData())
+            )
+            self.peak_table.setCellWidget(i, 7, state_combo)
+
+            # 8. 类型
+            type_label = "基底峰" if peak.peak_type == "substrate" else "样品峰"
+            type_item = QTableWidgetItem(type_label)
+            type_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.peak_table.setItem(i, 8, type_item)
             
         self.peak_table.blockSignals(False)
 
@@ -1009,86 +1891,234 @@ class XRDAnalyzerGUI(QMainWindow):
         peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
         if not peak: return
         
-        # Sync CheckState first (locking)
-        if col == 2:
-            peak.fixed_center = (item.checkState() == Qt.Checked)
-        elif col == 3:
-            peak.fixed_height = (item.checkState() == Qt.Checked)
-        elif col == 4:
-            peak.fixed_fwhm = (item.checkState() == Qt.Checked)
-            
-        # Parse value for editing
+        text = item.text().strip()
+        value = None
         try:
-            text = item.text().strip()
-            if text == "NaN" or not text: return
-            val = float(text)
-            
+            if text and text != "NaN":
+                value = float(text)
+        except ValueError:
+            return
+
+        if col == 5 and value is not None:
+            fwhm_min, fwhm_max = Fitter.fwhm_bounds(peak.peak_type)
+            if not np.isfinite(value) or not fwhm_min <= value <= fwhm_max:
+                previous_fwhm = (
+                    peak.fwhm
+                    if peak.fwhm is not None
+                    else PSEUDO_VOIGT_FWHM_FACTOR * peak.sigma_guess
+                    if peak.sigma_guess is not None
+                    else None
+                )
+                self.peak_table.blockSignals(True)
+                item.setText(
+                    f"{previous_fwhm:.4f}"
+                    if previous_fwhm is not None
+                    else "NaN"
+                )
+                self.peak_table.blockSignals(False)
+                QMessageBox.warning(
+                    self,
+                    "FWHM超出范围",
+                    f"{peak.peak_type}峰的FWHM必须在 "
+                    f"{fwhm_min:.2f}–{fwhm_max:.2f}°（2θ）之间。",
+                )
+                return
+
+        if col == 6 and value is not None:
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                previous_eta = peak.eta if peak.eta is not None else peak.fraction_guess
+                self.peak_table.blockSignals(True)
+                item.setText(
+                    f"{previous_eta:.4f}" if previous_eta is not None else "NaN"
+                )
+                self.peak_table.blockSignals(False)
+                QMessageBox.warning(
+                    self,
+                    "η超出范围",
+                    "Pseudo-Voigt Lorentzian比例η必须在0和1之间。",
+                )
+                return
+
+        fixed_attribute = {
+            2: 'fixed_center',
+            4: 'fixed_height',
+            5: 'fixed_fwhm',
+        }.get(col)
+        fixed_changed = (
+            fixed_attribute is not None
+            and getattr(peak, fixed_attribute) != (item.checkState() == Qt.Checked)
+        )
+        value_changed = False
+        if col == 2 and value is not None:
+            value_changed = peak.center_guess != value or peak.center != value
+        elif col == 4 and value is not None:
+            value_changed = peak.height_guess != value or peak.height != value
+        elif col == 5 and value is not None:
+            value_changed = (
+                peak.sigma_guess != value / PSEUDO_VOIGT_FWHM_FACTOR
+                or peak.fwhm != value
+            )
+        elif col == 6 and value is not None:
+            value_changed = peak.fraction_guess != value or peak.eta != value
+
+        if not fixed_changed and not value_changed:
+            return
+
+        if fixed_changed:
+            setattr(peak, fixed_attribute, item.checkState() == Qt.Checked)
+
+        if value_changed:
             if col == 2: # Center
-                peak.center_guess = val
+                peak.center_guess = value
                 # Update bounds
                 if peak.bounds:
                     width = peak.bounds[1] - peak.bounds[0]
-                    peak.bounds = (val - width/2, val + width/2)
+                    peak.bounds = (value - width/2, value + width/2)
                 # Update center result too, so it persists
-                peak.center = val
+                peak.center = value
                 
-            elif col == 3: # Height
-                peak.height_guess = val
-                peak.height = val
+            elif col == 4: # Height
+                peak.height_guess = value
+                peak.height = value
                 
-            elif col == 4: # FWHM
-                # Convert FWHM to sigma (approximate for guess)
-                # Pseudo-Voigt FWHM ≈ 2.3548 * sigma (if Gaussian)
-                # or 2 * sigma (if Lorentzian)
-                # We use factor 2.2 as a middle ground for guess
-                peak.sigma_guess = val / 2.2
-                peak.fwhm = val
-                
-        except ValueError:
-            pass # Ignore invalid input
-    
-    def quick_add_peak(self):
-        """快速添加峰"""
-        text = self.quick_peak_input.text().strip()
-        if not text:
+            elif col == 5: # FWHM
+                # lmfit PseudoVoigtModel精确定义FWHM = 2 * sigma。
+                peak.sigma_guess = value / PSEUDO_VOIGT_FWHM_FACTOR
+                peak.fwhm = value
+
+            elif col == 6: # Pseudo-Voigt fraction
+                peak.fraction_guess = value
+                peak.eta = value
+
+        self.invalidate_after_peak_edit()
+
+    def invalidate_after_peak_edit(self) -> None:
+        """峰参数或锁定状态改变后，确保下一次拟合重建模型。"""
+        if self.fitter is None:
             return
-            
+        self.fitter.invalidate_fit_state()
+        self.clear_stale_fit_display()
+        self.update_peak_table()
+        self.redraw_peak_guesses()
+        self.statusBar().showMessage("峰参数已修改，请重新拟合")
+
+    def set_peak_fit_state(self, peak_id: int, state: str) -> None:
+        """设置本轮峰状态；冻结要求已有完整且被接受的峰形参数。"""
+        if self.fitter is None:
+            return
+        peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
+        if peak is None or state not in {'optimize', 'frozen', 'disabled'}:
+            return
+
+        if state == 'frozen' and any(
+            value is None
+            for value in (
+                peak.area_guess,
+                peak.sigma_guess,
+                peak.fraction_guess,
+            )
+        ):
+            QMessageBox.warning(
+                self,
+                "不能冻结峰形",
+                "请先拟合并点击“接受当前结果作为下一轮初值”。",
+            )
+            self.update_peak_table()
+            return
+
+        if peak.fit_state == state:
+            return
+        peak.fit_state = state
+        self.fitter.invalidate_fit_state()
+        self.refresh_after_peak_change()
+    
+    def update_peak_input_mode(self) -> None:
+        """切换数值添加峰时的输入语义和单位。"""
+        if self.peak_input_mode.currentData() == 'd_spacing':
+            self.peak_value_input.setRange(0.000001, 1000.0)
+            self.peak_value_input.setSuffix(" Å")
+            self.peak_value_input.setToolTip(
+                "一级布拉格条件下的理论晶面间距d，不是晶格常数"
+            )
+        else:
+            self.peak_value_input.setRange(0.000001, 179.999999)
+            self.peak_value_input.setSuffix(" °")
+            self.peak_value_input.setToolTip("衍射峰中心位置2θ，单位为度")
+
+    def current_radiation_label(self) -> str:
+        """根据项目波长返回用于结果溯源的辐射标签。"""
+        if np.isclose(
+            self.wavelength_spin.value(),
+            DEFAULT_WAVELENGTH_ANGSTROM,
+            rtol=0.0,
+            atol=5e-7,
+        ):
+            return DEFAULT_RADIATION_LABEL
+        return '自定义波长'
+
+    def on_wavelength_changed(self) -> None:
+        """同步项目波长到派生量和后续导出，不重新执行峰拟合。"""
+        if self.reporter is None:
+            return
+        self.reporter.wavelength_angstrom = self.wavelength_spin.value()
+        self.reporter.radiation_label = self.current_radiation_label()
+
+    def quick_add_peak(self):
+        """按直接2θ或理论晶面间距d添加峰。"""
+        if self.x_data is None or self.y_data is None or len(self.x_data) == 0:
+            QMessageBox.warning(self, "没有数据", "请先加载XRD数据")
+            return
+
         try:
-            # 解析格式: angle - type - name
-            parts = [p.strip() for p in text.split('-')]
-            
-            if len(parts) < 1:
-                raise ValueError("格式错误")
-                
-            center = float(parts[0])
-            
-            peak_type = 'film'
-            if len(parts) >= 2:
-                t = parts[1].lower()
-                if 'sub' in t:
-                    peak_type = 'substrate'
-                elif 'film' in t:
-                    peak_type = 'film'
-            
-            name = ''
-            if len(parts) >= 3:
-                name = parts[2]
-                
-            # 添加
-            self.add_peak_to_fitter(center, (center-0.5, center+0.5), peak_type, name)
-            self.quick_peak_input.clear()
-            self.statusBar().showMessage(f"已添加峰: {center}° {name}")
-            
-        except ValueError:
-            QMessageBox.warning(self, "格式错误", 
-                              "请使用格式: 角度 - 类型 - 名称\n例如: 46.5 - film - PZT(002)")
+            input_value = self.peak_value_input.value()
+            wavelength = self.wavelength_spin.value()
+            input_mode = self.peak_input_mode.currentData()
+            if input_mode == 'd_spacing':
+                center = BraggGeometry.two_theta_from_d(
+                    input_value,
+                    wavelength,
+                )
+            else:
+                center = input_value
+                BraggGeometry.d_from_two_theta(center, wavelength)
+        except ValueError as exc:
+            QMessageBox.warning(self, "输入无效", str(exc))
+            return
+
+        data_min = float(np.min(self.x_data))
+        data_max = float(np.max(self.x_data))
+        if not data_min <= center <= data_max:
+            QMessageBox.warning(
+                self,
+                "峰位超出数据范围",
+                f"计算得到的峰位 2θ = {center:.6f}°，"
+                f"不在当前数据范围 {data_min:.6f}–{data_max:.6f}° 内。",
+            )
+            return
+
+        peak_type = self.peak_type_combo.currentData()
+        name = self.peak_name_input.text().strip()
+        bounds = (max(center - 0.5, data_min), min(center + 0.5, data_max))
+        self.add_peak_to_fitter(center, bounds, peak_type, name)
+        self.peak_name_input.clear()
+        if input_mode == 'd_spacing':
+            self.statusBar().showMessage(
+                f"已添加峰: d = {input_value:.6f} Å, "
+                f"λ = {wavelength:.6f} Å → 2θ = {center:.6f}° {name}"
+            )
+        else:
+            self.statusBar().showMessage(f"已添加峰: 2θ = {center:.6f}° {name}")
+
+    @staticmethod
+    def peak_library_directory() -> Path:
+        """返回项目内峰列表的默认导入与导出目录。"""
+        program_dir = Path(__file__).resolve().parent
+        database_dir = program_dir / "database"
+        return database_dir if database_dir.is_dir() else program_dir
 
     def import_peaks_from_file(self):
         """从文件导入峰列表"""
-        # 确定初始目录: 程序所在目录/database
-        program_dir = Path(__file__).parent.absolute()
-        database_dir = program_dir / "database"
-        start_dir = str(database_dir) if database_dir.exists() else str(program_dir)
+        start_dir = str(self.peak_library_directory())
         
         file_path, _ = QFileDialog.getOpenFileName(
             self, "导入峰列表", start_dir, "Text Files (*.txt);;All Files (*)"
@@ -1104,7 +2134,7 @@ class XRDAnalyzerGUI(QMainWindow):
             x_max = self.x_data.max()
             
         try:
-            count = 0
+            peaks_to_add = []
             skipped = 0
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -1112,7 +2142,7 @@ class XRDAnalyzerGUI(QMainWindow):
                     if not line or line.startswith('#'):
                         continue
                         
-                    parts = [p.strip() for p in line.split('-')]
+                    parts = [p.strip() for p in line.split('-', 2)]
                     if len(parts) < 1:
                         continue
                         
@@ -1134,11 +2164,20 @@ class XRDAnalyzerGUI(QMainWindow):
                         if len(parts) >= 3:
                             name = parts[2]
                             
-                        self.add_peak_to_fitter(center, (center-0.5, center+0.5), peak_type, name)
-                        count += 1
+                        peaks_to_add.append(
+                            (center, (center - 0.5, center + 0.5), peak_type, name)
+                        )
                     except ValueError:
                         continue
-                        
+
+            if peaks_to_add:
+                if self.fitter is None:
+                    self.fitter = Fitter(self.x_data, self.y_data)
+                for center, bounds, peak_type, name in peaks_to_add:
+                    self.fitter.add_peak(center, bounds, peak_type, name)
+                self.refresh_after_peak_change()
+
+            count = len(peaks_to_add)
             msg = f"成功导入 {count} 个峰"
             if skipped > 0:
                 msg += f" (已忽略 {skipped} 个超出范围的峰)"
@@ -1147,9 +2186,87 @@ class XRDAnalyzerGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "导入失败", f"错误: {str(e)}")
 
+    def export_fitted_peaks_to_file(self) -> None:
+        """将当前有效拟合结果的峰位导出为可再次导入的TXT峰列表。"""
+        if self.fitter is None or self.fitter.result is None:
+            QMessageBox.warning(self, "没有拟合结果", "请先完成一次拟合")
+            return
+
+        fitted_peaks = [
+            peak
+            for peak in self.fitter.peaks
+            if peak.fit_state != "disabled" and peak.center is not None
+        ]
+        if not fitted_peaks:
+            QMessageBox.warning(self, "没有可导出的峰", "当前拟合结果中没有有效峰位")
+            return
+
+        default_stem = (
+            f"{Path(str(self.current_file)).stem}_peaks"
+            if self.current_file
+            else "fitted_peak_positions"
+        )
+        default_path = self.peak_library_directory() / f"{default_stem}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出拟合峰位置",
+            str(default_path),
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path).with_suffix(".txt")
+        lines = [
+            "# XRD Analyzer fitted peak positions",
+            "# 2theta_deg - type - name",
+        ]
+        for peak in fitted_peaks:
+            safe_name = " ".join(str(peak.name).splitlines()).strip()
+            lines.append(
+                f"{float(peak.center):.6f} - {peak.peak_type} - {safe_name}"
+            )
+
+        try:
+            output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", str(exc))
+            return
+        self.statusBar().showMessage(f"已导出 {len(fitted_peaks)} 个拟合峰位: {output_path.name}")
+
+    def apply_peak_shift(self, delta_2theta_deg: float) -> None:
+        """整体平移全部峰位；单位为degree 2theta。"""
+        if self.fitter is None or not self.fitter.peaks:
+            QMessageBox.warning(self, "没有峰", "请先导入或添加峰")
+            return
+        try:
+            shifted_count = self.fitter.shift_peaks(delta_2theta_deg)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法平移峰位", str(exc))
+            return
+        if shifted_count == 0:
+            return
+        self.refresh_after_peak_change()
+        direction = "右" if delta_2theta_deg > 0 else "左"
+        self.statusBar().showMessage(
+            f"{shifted_count} 个峰已向{direction}平移 "
+            f"{abs(delta_2theta_deg):.6f}° (2θ)"
+        )
+
+    def apply_peak_shift_from_slider(self) -> None:
+        """应用回中式滑块选择的峰位整体平移量。"""
+        slider_steps = self.peak_shift_slider.value()
+        self.peak_shift_slider.setValue(0)
+        if slider_steps:
+            self.apply_peak_shift(slider_steps * self.peak_shift_step.value())
+
     def delete_selected_peak(self):
         """删除选中的峰"""
         if self.fitter is None:
+            return
+
+        if self.is_fitting():
+            QMessageBox.warning(self, "拟合进行中", "请等待当前拟合结束后再删除峰")
             return
         
         selected_rows = set(item.row() for item in self.peak_table.selectedItems())
@@ -1163,28 +2280,16 @@ class XRDAnalyzerGUI(QMainWindow):
         for row in selected_rows:
             peak_id = int(self.peak_table.item(row, 0).text())
             peak_ids_to_delete.append(peak_id)
-        
-        # 删除峰
-        for peak_id in sorted(peak_ids_to_delete, reverse=True):
-            self.fitter.remove_peak(peak_id)
-        
-        # 更新显示
-        self.update_peak_table()
-        self.plot_canvas.clear_peak_markers()
-        
-        # 重新添加标记
-        for peak in self.fitter.peaks:
-            idx = np.argmin(np.abs(self.x_data - peak.center_guess))
-            self.plot_canvas.add_peak_marker(
-                peak.center_guess, self.y_data[idx], peak.peak_id, peak.name
-            )
+
+        self.fitter.remove_peaks(peak_ids_to_delete)
+        self.refresh_after_peak_change()
+        self.statusBar().showMessage("峰已删除，请重新拟合")
     
     def clear_all_peaks(self):
         """清除所有峰"""
-        if self.fitter is not None:
-            self.fitter.peaks.clear()
-            self.update_peak_table()
-            self.plot_canvas.clear_peak_markers()
+        if self.fitter is not None and self.fitter.peaks:
+            self.fitter.clear_peaks()
+            self.refresh_after_peak_change()
     
     def sync_table_to_peaks(self):
         """将表格中的锁定状态同步回Peak对象"""
@@ -1196,13 +2301,13 @@ class XRDAnalyzerGUI(QMainWindow):
             # 找到对应的peak对象 (peak_id可能不等于索引，如果删除过)
             peak = next((p for p in self.fitter.peaks if p.peak_id == peak_id), None)
             if peak:
-                # 现在的复选框集成在 2, 3, 4 列中
+                # 位置、高度和FWHM的复选框分别位于2、4、5列
                 peak.fixed_center = (self.peak_table.item(i, 2).checkState() == Qt.Checked)
-                peak.fixed_height = (self.peak_table.item(i, 3).checkState() == Qt.Checked)
-                peak.fixed_fwhm = (self.peak_table.item(i, 4).checkState() == Qt.Checked)
+                peak.fixed_height = (self.peak_table.item(i, 4).checkState() == Qt.Checked)
+                peak.fixed_fwhm = (self.peak_table.item(i, 5).checkState() == Qt.Checked)
 
     def refine_fitting(self):
-        """基于当前结果优化拟合"""
+        """基于当前人工设置或已接受初值重新拟合。"""
         if self.fitter is None:
             QMessageBox.warning(self, "警告", "请先添加峰")
             return
@@ -1210,51 +2315,88 @@ class XRDAnalyzerGUI(QMainWindow):
         # 1. 同步锁定状态 (fallback)
         self.sync_table_to_peaks()
         
-        # Note: We do NOT call update_guesses_from_result() here anymore.
-        # The Peak objects are already updated automatically after the last fit,
-        # or manually by the user via the table.
-        # Calling update_guesses_from_result() would revert manual edits to the old result values.
+        # 候选结果不会自动覆盖初值；这里只使用人工输入或已接受的初值。
         
         # 2. 重新执行拟合
         self.statusBar().showMessage('正在优化拟合...')
         self.execute_fitting()
+
+    def accept_current_fit(self) -> None:
+        """人工接受当前候选结果，保存完整峰形为下一轮初值。"""
+        if self.fitter is None or self.fitter.result is None:
+            QMessageBox.warning(self, "没有候选结果", "请先完成一次拟合")
+            return
+
+        diagnostics = self.fitter.fit_diagnostics
+        if not diagnostics.get('success', False):
+            reply = QMessageBox.question(
+                self,
+                "结果未收敛",
+                "求解器没有报告成功。仍然接受这个候选结果作为下一轮初值吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self.fitter.accept_current_result()
+        self.update_peak_table()
+        self.statusBar().showMessage("已接受当前结果，可冻结峰形或继续优化")
 
     def execute_fitting(self):
         """执行拟合"""
         if self.fitter is None or len(self.fitter.peaks) == 0:
             QMessageBox.warning(self, "警告", "请先添加峰")
             return
+
+        # Excel 项目中的 result 只用于复现显示；继续拟合时必须按当前 GUI 中的
+        # 冻结/锁定状态重新建模，不能沿用恢复时为绘图构造的全固定参数模型。
+        if self.fitter.result is not None and getattr(
+            self.fitter.result, "restored", False
+        ):
+            self.fitter.invalidate_fit_state()
             
         # 确保锁定状态同步（即使是初次拟合，用户也可能先勾选了锁定）
         self.sync_table_to_peaks()
         
+        try:
+            fit_configuration = self.current_fit_configuration()
+        except ValueError as exc:
+            QMessageBox.warning(self, "拟合区间格式错误", str(exc))
+            return
+
+        self.backend.set_fit_configuration(fit_configuration)
+
         # 显示进度条
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         
         # 创建拟合线程
-        log_weight = self.log_spin.value() / 100.0
-        
-        fixed_bg = self.bg_spin.value() if self.bg_fix_cb.isChecked() else None
-        
         self.fit_thread = FittingThread(
             self.fitter,
-            self.constrain_fwhm_cb.isChecked(),
-            self.min_separation.value(),
-            log_weight=log_weight,
-            fixed_background=fixed_bg
+            fit_configuration.constrain_fwhm,
+            fit_configuration.min_peak_separation,
+            method=fit_configuration.method,
+            objective_mode=fit_configuration.objective_mode,
+            log_weight=fit_configuration.log_weight,
+            intensity_floor=fit_configuration.intensity_floor,
+            include_ranges=list(fit_configuration.include_ranges),
+            exclude_ranges=list(fit_configuration.exclude_ranges),
+            fixed_background=fit_configuration.fixed_background,
         )
         
         self.fit_thread.progress.connect(self.progress_bar.setValue)
         self.fit_thread.finished.connect(self.on_fitting_finished)
         self.fit_thread.error.connect(self.on_fitting_error)
         
+        self.set_peak_editing_enabled(False)
         self.fit_thread.start()
         self.statusBar().showMessage('正在拟合...')
     
     def on_fitting_finished(self, result):
         """拟合完成处理"""
         self.progress_bar.setVisible(False)
+        self.set_peak_editing_enabled(True)
         
         # 更新背景显示 (如果未固定)
         if not self.bg_fix_cb.isChecked() and self.fitter.result is not None:
@@ -1266,7 +2408,9 @@ class XRDAnalyzerGUI(QMainWindow):
         self.reporter = Reporter(
             self.fitter, 
             x_original=self.x_data_original,  # 新增
-            y_original=self.y_data_original   # 新增
+            y_original=self.y_data_original,  # 新增
+            wavelength_angstrom=self.wavelength_spin.value(),
+            radiation_label=self.current_radiation_label(),
         )
         self.reporter.calculate_metrics()
         
@@ -1275,23 +2419,48 @@ class XRDAnalyzerGUI(QMainWindow):
         
         # 更新峰列表表格
         self.update_peak_table()
+
+        # 只有完成优化并产生新结果时，才写入撤销/恢复历史。
+        self.record_completed_fit()
         
-        # 显示结果
-        self.display_results()
-        
-        # 计算物理参数
-        self.display_physics_parameters()
-        
-        self.statusBar().showMessage('拟合完成！')
-        
-        QMessageBox.information(
-            self, "成功", 
-            f"拟合完成！\nR² = {self.reporter.metrics['R_squared']:.6f}"
-        )
+        diagnostics = self.fitter.fit_diagnostics
+        boundary_hits = diagnostics.get('boundary_hits', [])
+        success = diagnostics.get('success', False)
+        covariance_available = diagnostics.get('covariance_available', False)
+        message = diagnostics.get('message', '')
+        nfev = diagnostics.get('nfev', 0)
+
+        details = [
+            f"求解器消息：{message}",
+            f"函数评估次数：{nfev}",
+            f"R²_fit：{self.reporter.metrics['R_squared_fit']:.6f}",
+            f"协方差：{'可用' if covariance_available else '不可用'}",
+        ]
+        if boundary_hits:
+            details.append("边界命中：" + ", ".join(boundary_hits))
+        fit_warnings = diagnostics.get('warnings', [])
+        if fit_warnings:
+            details.append("数值警告：" + " | ".join(fit_warnings))
+
+        if success and covariance_available and not boundary_hits and not fit_warnings:
+            self.statusBar().showMessage('拟合完成，结果尚未接受')
+            QMessageBox.information(
+                self,
+                "候选拟合结果",
+                "\n".join(details) + "\n\n请检查后点击“接受当前结果”。",
+            )
+        else:
+            self.statusBar().showMessage('拟合结束，但结果需要检查')
+            QMessageBox.warning(
+                self,
+                "候选结果需要检查",
+                "\n".join(details) + "\n\n该结果不会自动成为下一轮初值。",
+            )
     
     def on_fitting_error(self, error_msg):
         """拟合错误处理"""
         self.progress_bar.setVisible(False)
+        self.set_peak_editing_enabled(True)
         QMessageBox.critical(self, "拟合错误", f"拟合过程中出错:\n{error_msg}")
         self.statusBar().showMessage('拟合失败')
     
@@ -1301,16 +2470,28 @@ class XRDAnalyzerGUI(QMainWindow):
             return
         
         # 清除并重绘
+        self.plot_canvas.clear_axes()
         ax = self.plot_canvas.axes
-        ax.clear()
         
         # 原始数据
         ax.scatter(self.fitter.x_data, self.fitter.y_data, 
                   s=15, alpha=0.5, label='Data', color='gray', zorder=1)
+        if self.fitter.fit_mask is not None and not np.all(self.fitter.fit_mask):
+            ax.scatter(
+                self.fitter.x_data[self.fitter.fit_mask],
+                self.fitter.y_data[self.fitter.fit_mask],
+                s=18,
+                alpha=0.75,
+                facecolors='none',
+                edgecolors='black',
+                linewidths=0.5,
+                label='本轮拟合点',
+                zorder=2,
+            )
         
         # 拟合曲线
-        ax.plot(self.fitter.x_data, self.fitter.y_fit, 
-               'r-', linewidth=2.5, label='Fit', zorder=3)
+        ax.plot(self.fitter.x_data, self.fitter.y_fit,
+               'r-', linewidth=2.5, label='Total', zorder=3)
         
         # 各个峰的分量
         peak_curves = self.fitter.get_individual_peaks()
@@ -1318,10 +2499,21 @@ class XRDAnalyzerGUI(QMainWindow):
         
         for i, (peak_id, curve) in enumerate(peak_curves.items()):
             peak = self.fitter.peaks[peak_id]
-            label = f'Peak {peak_id} ({peak.peak_type})\n2θ={peak.center:.3f}°'
+            label = peak.name.strip() if peak.name else 'Unnamed peak'
             ax.plot(self.fitter.x_data, curve, 
                    '--', color=colors[i], linewidth=2, 
                    alpha=0.7, label=label, zorder=2)
+
+        for index, (lower, upper) in enumerate(
+            self.fitter.fit_config.get('exclude_ranges', [])
+        ):
+            ax.axvspan(
+                lower,
+                upper,
+                color='gray',
+                alpha=0.18,
+                label='本轮排除区间' if index == 0 else None,
+            )
         
         # 设置标签
         ax.set_xlabel('2θ (degree)', fontsize=12, fontweight='bold')
@@ -1360,10 +2552,9 @@ class XRDAnalyzerGUI(QMainWindow):
                        ha='center', va='bottom',
                        fontsize=9, color='darkblue', fontweight='bold')
         
-        # 添加R²文本
-        r2 = self.reporter.metrics['R_squared']
-        chi2 = self.reporter.metrics['Reduced_Chi_squared']
-        text = f'R² = {r2:.6f}\nχ²ᵣ = {chi2:.4f}'
+        # 只显示本轮实际参与优化的数据点上的线性强度R²。
+        r2_fit = self.reporter.metrics['R_squared_fit']
+        text = f'R²_fit = {r2_fit:.6f}'
         ax.text(0.02, 0.98, text, 
                transform=ax.transAxes, 
                verticalalignment='top',
@@ -1371,107 +2562,6 @@ class XRDAnalyzerGUI(QMainWindow):
                fontsize=11, fontweight='bold')
         
         self.plot_canvas.draw()
-    
-    def display_results(self):
-        """显示拟合结果"""
-        if self.reporter is None:
-            return
-        
-        text = "=" * 60 + "\n"
-        text += "拟合结果详情\n"
-        text += "=" * 60 + "\n\n"
-        
-        # 评估指标
-        text += "【拟合质量评估】\n"
-        text += "-" * 40 + "\n"
-        for key, value in self.reporter.metrics.items():
-            text += f"{key:25s}: {value:.6e}\n"
-        text += "\n"
-        
-        # 各峰参数
-        text += "【峰参数】\n"
-        text += "-" * 40 + "\n"
-        for peak in self.fitter.peaks:
-            text += f"\nPeak {peak.peak_id} ({peak.peak_type}):\n"
-            text += f"  中心位置 (2θ)    : {peak.center:.4f}°\n"
-            text += f"  峰高 (Intensity) : {peak.height:.2f}\n"
-            text += f"  FWHM             : {peak.fwhm:.4f}°\n"
-            text += f"  峰面积           : {peak.area:.2f}\n"
-            text += f"  η (P-V混合比)    : {peak.eta:.4f}\n"
-        
-        # lmfit报告
-        text += "\n" + "=" * 60 + "\n"
-        text += "【Lmfit拟合报告】\n"
-        text += "=" * 60 + "\n"
-        text += self.fitter.get_fit_report()
-        
-        self.results_text.setPlainText(text)
-    
-    def display_physics_parameters(self):
-        """显示物理参数"""
-        if self.reporter is None:
-            return
-        
-        text = "=" * 60 + "\n"
-        text += "物理参数计算\n"
-        text += "=" * 60 + "\n\n"
-        
-        # 计算晶格参数
-        lattice_params = self.reporter.calculate_lattice_parameters()
-        
-        text += "【晶格参数】(λ = 1.5406 Å, Cu Kα)\n"
-        text += "-" * 40 + "\n"
-        
-        for key, value in lattice_params.items():
-            if key == 'Tetragonality':
-                text += f"\n{key}:\n"
-                text += f"  c轴晶格常数: {value['c_axis']:.6f} Å\n"
-                text += f"  a轴晶格常数: {value['a_axis']:.6f} Å\n"
-                text += f"  四方度 (c/a): {value['c/a_ratio']:.6f}\n"
-                
-                # 判断相结构
-                if value['c/a_ratio'] > 1.01:
-                    text += f"  → 四方相占主导 (Tetragonal)\n"
-                elif value['c/a_ratio'] < 0.99:
-                    text += f"  → 可能存在压应变\n"
-                else:
-                    text += f"  → 接近立方相或应变释放\n"
-            else:
-                text += f"\n{key}:\n"
-                if isinstance(value, dict):
-                    for k, v in value.items():
-                        if isinstance(v, (int, float)):
-                            text += f"  {k:20s}: {v:.6f}\n"
-        
-        # 晶粒尺寸估算 (Scherrer公式)
-        text += "\n【晶粒尺寸估算】(Scherrer公式)\n"
-        text += "-" * 40 + "\n"
-        text += "D = Kλ / (β·cosθ)\n"
-        text += "K = 0.9 (形状因子)\n\n"
-        
-        for peak in self.fitter.peaks:
-            if peak.fwhm is not None and peak.center is not None:
-                # FWHM转换为弧度
-                beta_rad = np.radians(peak.fwhm)
-                theta_rad = np.radians(peak.center / 2)
-                
-                # Scherrer公式
-                K = 0.9
-                wavelength = 1.5406  # Å
-                D_nm = (K * wavelength) / (beta_rad * np.cos(theta_rad)) / 10  # 转换为nm
-                
-                text += f"Peak {peak.peak_id} ({peak.peak_type}):\n"
-                text += f"  晶粒尺寸: {D_nm:.2f} nm\n"
-        
-        # 应力/应变分析
-        text += "\n【应力分析提示】\n"
-        text += "-" * 40 + "\n"
-        text += "• 如果002和200峰分裂明显 → 存在四方相畸变\n"
-        text += "• 峰位偏移 → 存在晶格应变\n"
-        text += "• 峰展宽 → 晶粒尺寸减小或微观应变增大\n"
-        text += "• 建议结合sin²ψ方法进行残余应力定量分析\n"
-        
-        self.physics_text.setPlainText(text)
     
     def export_excel(self):
         """导出Excel报告"""
@@ -1494,7 +2584,12 @@ class XRDAnalyzerGUI(QMainWindow):
         
         if file_path:
             try:
-                self.reporter.export_results(file_path)
+                self.reporter.export_results(
+                    file_path,
+                    project_state=self.collect_project_state(),
+                    source_files=[entry[0] for entry in self.loaded_files_data],
+                    source_datasets=self.loaded_files_data,
+                )
                 QMessageBox.information(self, "成功", f"结果已导出至:\n{file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败:\n{str(e)}")
@@ -1531,26 +2626,3 @@ class XRDAnalyzerGUI(QMainWindow):
                 QMessageBox.information(self, "成功", f"图片已保存至:\n{file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存失败:\n{str(e)}")
-
-
-def main():
-    """主函数"""
-    app = QApplication(sys.argv)
-    
-    # 设置应用样式
-    app.setStyle('Fusion')
-    
-    # 设置全局字体
-    font = QFont("Microsoft YaHei", 10)
-    app.setFont(font)
-    
-    # 创建主窗口
-    window = XRDAnalyzerGUI()
-    window.show()
-    
-    sys.exit(app.exec_())
-
-
-if __name__ == '__main__':
-    main()
-

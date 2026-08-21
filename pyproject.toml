@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xrd-analyzer"
+version = "1.0.0"
+description = "General-purpose desktop XRD analysis, peak fitting, and reporting tool"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt5>=5.15.0",
+  "numpy>=1.20.0",
+  "scipy>=1.7.0",
+  "matplotlib>=3.4.0",
+  "pandas>=1.3.0",
+  "lmfit>=1.0.3",
+  "openpyxl>=3.0.9",
+  "threadpoolctl>=3.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.8",
+]
+
+[project.scripts]
+xrd-analyzer = "main:main"
+xrd-plot-results = "plot_from_excel:main"
+
+[project.urls]
+Repository = "https://github.com/ShawnWolgu/xrd-analyzer"
+
+[tool.setuptools]
+py-modules = [
+  "app_metadata",
+  "convert_csv_to_txt",
+  "main",
+  "plot_style",
+  "plot_from_excel",
+  "xrd_backend",
+  "xrd_crystallography",
+  "xrd_analyzer",
+  "xrd_gui",
+  "xrd_io",
+  "xrd_peaks",
+  "xrd_preprocessing",
+  "xrd_project",
+  "xrd_session",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "baseline: versioned core baseline and historical regression checks",
+  "scientific: tests for numerical or physical behavior",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Begin with correctness checks that the legacy source can satisfy. Expand during extraction.
+select = ["E9", "F63", "F7", "F82"]

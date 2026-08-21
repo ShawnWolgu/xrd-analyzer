@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "evidence_level": "SYNTHETIC-REFERENCE",
+  "coordinate_unit": "degree_2theta",
+  "intensity_unit": "a.u.",
+  "wavelength_angstrom": 1.5406,
+  "scan": {
+    "start": 42.0,
+    "stop": 46.0,
+    "point_count": 401,
+    "constant_background": 7.0
+  },
+  "peaks": [
+    {
+      "name": "MgO",
+      "type": "substrate",
+      "center": 42.98,
+      "center_guess": 42.95,
+      "bounds": [42.7, 43.2],
+      "area": 500.0,
+      "sigma": 0.05,
+      "fraction": 0.4,
+      "characteristic_length_angstrom": 2.1026981891113348
+    },
+    {
+      "name": "002",
+      "type": "film",
+      "center": 43.95,
+      "center_guess": 44.0,
+      "bounds": [43.5, 44.3],
+      "area": 300.0,
+      "sigma": 0.18,
+      "fraction": 0.25,
+      "characteristic_length_angstrom": 2.0585138645990115
+    },
+    {
+      "name": "200",
+      "type": "film",
+      "center": 44.72,
+      "center_guess": 44.65,
+      "bounds": [44.4, 45.1],
+      "area": 200.0,
+      "sigma": 0.22,
+      "fraction": 0.6,
+      "characteristic_length_angstrom": 2.0248415508188264
+    }
+  ],
+  "fit": {
+    "method": "least_squares",
+    "objective_mode": "linear",
+    "minimum_peak_separation": 0.2
+  },
+  "tolerances": {
+    "center_absolute_degree": 0.00001,
+    "fwhm_absolute_degree": 0.00002,
+    "area_relative": 0.0001,
+    "fraction_absolute": 0.0001,
+    "characteristic_length_absolute_angstrom": 0.000001,
+    "minimum_r_squared_fit": 0.999999999
+  }
+}

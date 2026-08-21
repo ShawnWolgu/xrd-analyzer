@@ -32,6 +32,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Optional
+
+from plot_style import apply_plot_style
+
+
+apply_plot_style()
 import argparse
 
 
@@ -43,7 +48,16 @@ class XRDPlotterFromExcel:
         self.data = None
         self.peaks = None
         self.metrics = None
-        self.lattice = None
+
+    @staticmethod
+    def _characteristic_length_column(columns) -> Optional[str]:
+        """查找新旧工作簿中的反射峰特征长度列。"""
+        candidates = (
+            'Characteristic_Length_d_Angstrom',
+            'd_spacing_Å',
+            'd_spacing_Angstrom',
+        )
+        return next((column for column in candidates if column in columns), None)
         
     def load_data(self):
         """加载Excel数据"""
@@ -54,13 +68,25 @@ class XRDPlotterFromExcel:
             self.data = pd.read_excel(self.excel_path, sheet_name='Full_Data')
             self.peaks = pd.read_excel(self.excel_path, sheet_name='Peak_Parameters')
             self.metrics = pd.read_excel(self.excel_path, sheet_name='Fit_Metrics')
-            
-            try:
-                self.lattice = pd.read_excel(self.excel_path, sheet_name='Lattice_Parameters')
-            except:
-                self.lattice = None
-                print("  未找到晶格参数信息")
-                
+
+            if self._characteristic_length_column(self.peaks.columns) is None:
+                try:
+                    legacy_lengths = pd.read_excel(
+                        self.excel_path,
+                        sheet_name='Lattice_Parameters',
+                    )
+                except ValueError:
+                    legacy_lengths = None
+
+                if legacy_lengths is not None and not legacy_lengths.empty:
+                    for row_index, peak_id in self.peaks['Peak_ID'].items():
+                        legacy_column = f'Peak_{int(peak_id)}_d_spacing'
+                        if legacy_column in legacy_lengths.columns:
+                            self.peaks.loc[
+                                row_index,
+                                'Characteristic_Length_d_Angstrom',
+                            ] = legacy_lengths.loc[0, legacy_column]
+
             print(f"  成功加载 {len(self.data)} 个数据点")
             print(f"  包含 {len(self.peaks)} 个峰")
             
@@ -158,18 +184,13 @@ class XRDPlotterFromExcel:
         ax1.legend(loc='best', fontsize=9, framealpha=0.9, ncol=2)
         ax1.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
-        # 添加拟合质量文本
-        r2 = self.metrics['R_squared'].values[0]
-        chi2 = self.metrics['Reduced_Chi_squared'].values[0]
-        
-        text = f'R² = {r2:.6f}\nχ²ᵣ = {chi2:.4f}'
-        
-        # 如果有四方度信息，也显示
-        if self.lattice is not None:
-            tet_cols = [col for col in self.lattice.columns if 'c/a' in col.lower()]
-            if tet_cols:
-                c_a_ratio = self.lattice[tet_cols[0]].values[0]
-                text += f'\nc/a = {c_a_ratio:.6f}'
+        # 新项目只显示拟合掩码内的R²；旧工作簿保留原标签以免误称。
+        if 'R_squared_fit' in self.metrics.columns:
+            r2 = self.metrics['R_squared_fit'].values[0]
+            text = f'R²_fit = {r2:.6f}'
+        else:
+            r2 = self.metrics['R_squared'].values[0]
+            text = f'R² (legacy) = {r2:.6f}'
         
         ax1.text(0.02, 0.98, text, 
                 transform=ax1.transAxes, 
@@ -183,17 +204,6 @@ class XRDPlotterFromExcel:
             
             ax2.axhline(y=0, color='gray', linestyle='--', linewidth=1, zorder=1)
             ax2.scatter(x_data, residuals, s=8, alpha=0.6, color='blue', zorder=2)
-            
-            # 添加残差的统计信息
-            rmse = np.sqrt(np.mean(residuals**2))
-            max_res = np.max(np.abs(residuals))
-            
-            ax2.text(0.98, 0.95, f'RMSE={rmse:.2f}\nMax={max_res:.2f}',
-                    transform=ax2.transAxes,
-                    verticalalignment='top',
-                    horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7),
-                    fontsize=9)
             
             ax2.set_xlabel('2θ (degree)', fontsize=13, fontweight='bold')
             ax2.set_ylabel('Residuals', fontsize=11, fontweight='bold')
@@ -354,21 +364,17 @@ class XRDPlotterFromExcel:
         # 峰参数
         print("\n【峰参数】")
         print("-"*40)
+        characteristic_length_column = self._characteristic_length_column(self.peaks.columns)
         for _, peak in self.peaks.iterrows():
             print(f"\nPeak {int(peak['Peak_ID'])} ({peak['Type']}):")
             print(f"  中心位置: {peak['Center_2theta']:.4f}°")
+            if characteristic_length_column is not None:
+                characteristic_length = peak[characteristic_length_column]
+                if pd.notna(characteristic_length):
+                    print(f"  特征长度 d: {characteristic_length:.6f} Å")
             print(f"  FWHM:     {peak['FWHM']:.4f}°")
             print(f"  峰高:     {peak['Height']:.2f}")
             print(f"  峰面积:   {peak['Area']:.2f}")
-        
-        # 晶格参数
-        if self.lattice is not None:
-            print("\n【晶格参数】")
-            print("-"*40)
-            for col in self.lattice.columns:
-                value = self.lattice[col].values[0]
-                if isinstance(value, (int, float)):
-                    print(f"  {col:30s}: {value:.6f}")
         
         print("\n" + "="*60)
 
